@@ -1,8 +1,7 @@
- # scripts/run_experiment.py
- """
- Core Philosophy: Config-Driven.
- Main entry point for running an A-Sys-I experiment.
- """
+"""
+Core Philosophy: Config-Driven.
+Main entry point for running an A-Sys-I experiment.
+"""
 import logging
 import signal
 import sys
