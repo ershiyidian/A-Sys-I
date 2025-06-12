@@ -54,7 +54,8 @@ dependencies = [
     "pyarrow",         # For Archiver
     "aiofiles",        # For Archiver
     "rich",            # For better logging/CLI
-    "einops"          # Tensor manipulations
+    "einops",          # Tensor manipulations
+    "deepmerge>=1.0"   # For config loading
 ]
 
 [project.urls]

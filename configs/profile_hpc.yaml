@@ -15,7 +15,7 @@ hardware:
    compile_model: true # Use torch 2.0 compile if available
 
 ppo:
-   max_steps: 50000
+   max_steps: 10
    batch_size: 128
 
 sae_model:
@@ -23,7 +23,7 @@ sae_model:
    d_sae: 3072 # 4x expansion. User can set this explicitly if not "auto"
    
 sae_trainer:
-   num_workers: 4 # User should adapt this to their hardware CPU core count
+   num_workers: 1 # User should adapt this to their hardware CPU core count
    batch_size: 8192
    
 hook:
@@ -32,13 +32,13 @@ hook:
   layers_to_hook: [0,1,2,3,4,5,6,7,8,9,10,11] # Example: all layers for a 12-layer model
 
 data_bus:
-  type: CPP_SHARDED_SPMC
+  type: cpp_sharded_spmc
   buffer_size_per_shard: 524288 # Large buffer capacity per shard
-  num_shards: 8 # High parallelism, typically matches number of trainers/GPUs or layers
+  num_shards: 1 # High parallelism, typically matches number of trainers/GPUs or layers
   shared_memory_size_gb: 32.0 # Allocate 32 GB shared memory for activations
 
 monitor:
-  type: PROMETHEUS
+  type: prometheus
   prometheus_port: 8001
   heartbeat_check_interval_sec: 15
   component_timeout_sec: 60 # Stricter timeout for HPC

@@ -77,7 +77,7 @@ class BaseDataBus(ABC):
         """Cleanly shut down the bus, releasing resources (shared memory, queues)."""
         log.info(f"Shutting down DataBus: {self.__class__.__name__}")
         self._is_ready = False
-        raise NotImplementedError
+        # Subclasses should implement specific cleanup
 
 # --- No-Op Implementation ---
 class NoOpDataBus(BaseDataBus):

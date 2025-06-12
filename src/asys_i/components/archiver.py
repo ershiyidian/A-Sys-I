@@ -1,7 +1,7 @@
- # src/asys_i/components/archiver.py
- """
- Core Philosophy: Separation, Design for Failure.
- Worker process responsible for consuming ActivationPackets from DataBus
+# src/asys_i/components/archiver.py
+"""
+Core Philosophy: Separation, Design for Failure.
+Worker process responsible for consuming ActivationPackets from DataBus
  and persisting them to storage (disk/object storage).
  High Cohesion: Purely data archiving.
  """

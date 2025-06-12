@@ -1,11 +1,12 @@
-  # src/asys_i/components/data_bus_hpc.py
- """
- Core Philosophy: Predictability (Performance).
- HPC mode data bus implementation: Python wrapper for C++ shared-memory ring buffer.
- Achieves high throughput via zero-copy (shared mem) and lock-free mechanisms, avoiding GIL.
- """
+# src/asys_i/components/data_bus_hpc.py
+"""
+Core Philosophy: Predictability (Performance).
+HPC mode data bus implementation: Python wrapper for C++ shared-memory ring buffer.
+Achieves high throughput via zero-copy (shared mem) and lock-free mechanisms, avoiding GIL.
+"""
 import logging
 import time
+import os # Added import for os.getpid()
 import multiprocessing.shared_memory
 import numpy as np
 import torch
@@ -34,7 +35,7 @@ except ImportError:
      CPP_AVAILABLE = False
      
 from asys_i.common.types import ActivationPacket, ConsumerID, LayerIndex, TensorRef, RunProfile
-from asys_i.orchestration.config_loader import DataBusConfig
+from asys_i.orchestration.config_loader import DataBusConfig, MasterConfig # Added MasterConfig
 from asys_i.monitoring.monitor_interface import BaseMonitor
 from asys_i.components.data_bus_interface import BaseDataBus
 from asys_i.hpc import check_hpc_prerequisites, CPP_EXTENSION_AVAILABLE
@@ -121,29 +122,30 @@ class CppShardedSPMCBus(BaseDataBus):
       - Consumers subscribe to specific shards.
       """
      def __init__(self,
-                   config: DataBusConfig,
+                   master_config: MasterConfig, # Changed parameter name and type
                    monitor: BaseMonitor):
+          bus_specific_config = master_config.data_bus # Extract DataBusConfig
           # Fail fast if C++ extension is not available
           # if not CPP_EXTENSION_AVAILABLE or cpp_backend is None:
           #     check_hpc_prerequisites() # Raises ImportError
-          if config.run_profile != RunProfile.HPC:
+          if master_config.run_profile != RunProfile.HPC: # Use master_config here
                log.warning("CppShardedSPMCBus initialized but run_profile is not HPC!")
                
-          super().__init__(config, monitor)
-          self.num_shards = config.num_shards
+          super().__init__(bus_specific_config, monitor) # Pass the extracted DataBusConfig
+          self.num_shards = bus_specific_config.num_shards # Use extracted config
           self.shards: List[Any] = []
           self.consumer_map: Dict[ConsumerID, List[int]] = {} # Map consumer_id to list of shard indices
           self.consumer_shard_cursor: Dict[ConsumerID, int] = {} # For round-robin pulling
 
           shm_name = f"asys_i_shm_{os.getpid()}_{int(time.time())}"
-          shm_size = int(config.shared_memory_size_gb * 1e9)
+          shm_size = int(bus_specific_config.shared_memory_size_gb * 1e9) # Use extracted config
           self.memory_manager = SharedMemoryManager(shm_name, shm_size, monitor)
 
-          log.info(f"Initializing {self.num_shards} C++ SPMC shards with capacity {config.buffer_size_per_shard} each.")
+          log.info(f"Initializing {self.num_shards} C++ SPMC shards with capacity {bus_specific_config.buffer_size_per_shard} each.") # Use extracted config
           for i in range(self.num_shards):
                 # Pass the buffer size to C++ constructor
-               # queue = cpp_backend.SPMCQueue(config.buffer_size_per_shard) 
-               queue = MockCppQueue(config.buffer_size_per_shard) # SIMULATION
+               # queue = cpp_backend.SPMCQueue(bus_specific_config.buffer_size_per_shard)
+               queue = MockCppQueue(bus_specific_config.buffer_size_per_shard) # SIMULATION
                self.shards.append(queue)
           
           self._is_ready = True

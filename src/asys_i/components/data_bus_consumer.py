@@ -1,11 +1,12 @@
- # src/asys_i/components/data_bus_consumer.py
- """
- Core Philosophy: Graceful Degradation.
- CONSUMER mode data bus implementation using Python's multiprocessing.Queue.
- Simple, cross-platform, but lower performance (GIL, serialization overhead).
- """
+# src/asys_i/components/data_bus_consumer.py
+"""
+Core Philosophy: Graceful Degradation.
+Consumer mode data bus implementation using Python's multiprocessing.Queue.
+Simple, cross-platform, but lower performance (GIL, serialization overhead).
+"""
 import logging
 import multiprocessing
+import torch
 import queue  # Import for queue.Empty and queue.Full exceptions
 import time
 from typing import List, Dict, Any, Optional
@@ -148,5 +149,4 @@ class PythonQueueBus(BaseDataBus):
         except Exception as e:
              log.warning(f"Error closing queue: {e}")
         log.info("PythonQueueBus resources released.")
-        import torch # Ensure torch is imported if tensors are involved
 

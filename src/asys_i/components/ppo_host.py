@@ -8,6 +8,7 @@ High Cohesion: Purely PPO training loop.
 import logging
 import time
 import torch
+import torch.nn.functional as F
 from threading import Event
 from typing import Callable, Optional
 # Conditional import for TRL
@@ -87,8 +88,19 @@ class PPOHostProcess:
         # self.ppo_trainer = PPOTrainer(self.ppo_trainer_config, self.model,...)
          
         # --- MOCK ---
-        self.model: nn.Module = MockModel(d_model=config.sae_model.d_in, n_layers=max(config.hook.layers_to_hook)+1 if config.hook.layers_to_hook else 1 )
-        self.model.to(config.hardware.device)
+        d_model_val = config.sae_model.d_in
+        if not isinstance(d_model_val, int):
+            log.warning(f"SAE d_in is '{d_model_val}', PPOHost's MockModel will use default d_model=768.")
+            d_model_val = 768 # Default for GPT2 if "auto" or other non-int
+
+        self.model: nn.Module = MockModel(d_model=d_model_val, n_layers=max(config.hook.layers_to_hook)+1 if config.hook.layers_to_hook else 1 )
+        try:
+            self.model.to(config.hardware.device)
+            log.info(f"MockModel moved to {config.hardware.device}")
+        except RuntimeError as e:
+            log.warning(f"Failed to move MockModel to {config.hardware.device} ({e}). Using CPU instead.")
+            self.config.hardware.device = "cpu" # Fallback to CPU
+            self.model.to("cpu")
         self.ppo_trainer = MockPPOTrainer()
         log.warning("PPOHostProcess is RUNNING IN MOCK MODE!")
         # ------------
