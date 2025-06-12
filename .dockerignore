@@ -1,0 +1,27 @@
+# .dockerignore
+.git
+.gitignore
+.dockerignore
+.pytest_cache
+.mypy_cache
+.venv
+env
+__pycache__
+*.pyc
+tests/
+.vscode/
+.idea/
+
+# Exclude outputs/logs from the build context to keep image small
+# These should be mounted as volumes
+outputs/
+logs/
+checkpoints/
+data/
+
+# Exclude dev docs
+docs/
+
+# Exclude raw data or large models not needed in the image itself
+# models_raw/
+

@@ -1,0 +1,41 @@
+# configs/profile_consumer.yaml: Configuration for local/dev machines
+# (FINAL VERSION)
+# Overrides base.yaml
+run_profile: CONSUMER
+
+project:
+  output_dir: "./outputs/consumer"
+  log_dir: "./logs/consumer"
+  checkpoint_dir: "./checkpoints/consumer"
+  log_level: "DEBUG"
+
+hardware:
+   dtype: "float32" # Consumer hardware might not support bf16/fp8
+
+ppo:
+   max_steps: 200 # Very short for testing
+
+sae_trainer:
+   num_workers: 1 # Keep it simple
+   batch_size: 1024
+
+hook:
+  sampling_rate: 0.8
+  # gpu_kernel_mode must be "NONE" for CONSUMER (validated by config_loader)
+
+# Explicitly set types for clarity, though config_loader defaults correctly
+data_bus:
+  type: PYTHON_QUEUE
+  buffer_size_per_shard: 10000 # Smaller buffer for consumer
+  num_shards: 1 # PythonQueue does not support sharding
+
+monitor:
+  type: CSV_TENSORBOARD
+  heartbeat_check_interval_sec: 45
+  component_timeout_sec: 120
+
+archiver:
+  enabled: true # Enable archiver for consumer tests
+
+# resource_manager binding ignored in CONSUMER
+

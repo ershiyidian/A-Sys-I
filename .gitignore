@@ -1,0 +1,106 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.dylib
+*.pyd
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller runs.
+#
+# *.manifest
+# *.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.hypothesis/
+.pytest_cache/
+junit/
+
+# Tmp files from tests
+*.tmp
+
+# build output / benchmark data
+*.json
+*.csv
+
+# IDE settings
+.idea/
+.vscode/
+*.swp
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+*.db # database files
+
+# Jupyter
+.ipynb_checkpoints
+
+# mypy
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
+
+# --- Project Specific ---
+# Output data, logs, checkpoints
+outputs/
+logs/
+checkpoints/
+data/
+*.log
+
+# Docker build context noise
+docker/prometheus_data/
+docker/grafana_data/
+
+# C++ Build artifacts
+src/asys_i/hpc/cpp_ringbuffer/build/
+*.o
+
+# OSX
+.DS_Store

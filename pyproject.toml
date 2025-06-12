@@ -1,0 +1,148 @@
+# pyproject.toml: PEP 621/518/660 compliant project definition
+[build-system]
+# Requires for building the project, especially C++ extensions
+requires = ["setuptools>=61.0", "wheel", "pybind11>=2.9", "cmake>=3.18", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a-sys-i"
+version = "0.1.0-alpha"
+description = "A-Sys-I: A non-intrusive observation system for AI model internals."
+readme = "README.md"
+requires-python = ">=3.9, <3.12"
+license = { file = "LICENSE" }
+authors = [
+  { name="Your Team", email="your.email@example.com" },
+]
+keywords = ["AI", "Interpretability", "Sparse Autoencoder", "HPC", "Observability", "LLM"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License", # Or Apache 2.0
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+     "Programming Language :: Python :: 3.11",
+    "Programming Language :: C++",
+    "Operating System :: POSIX :: Linux",
+     "Operating System :: MacOS",
+]
+
+# Core dependencies for both HPC and CONSUMER modes
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.30",
+    "datasets>=2.10",
+    "accelerate>=0.20",
+    "trl>=0.7.0",       # For PPO Host
+    "pydantic>=1.10,<2.0", # V2 might have breaking changes, pin for stability
+    "pyyaml>=6.0",
+    "numpy>=1.20",
+    "tqdm",
+    "psutil",          # For resource management & monitoring
+    "typer[all]>=0.9", # For CLI scripts
+    "tensorboard",     # Base monitoring
+    "pyarrow",         # For Archiver
+    "aiofiles",        # For Archiver
+    "rich",            # For better logging/CLI
+    "einops",          # Tensor manipulations
+]
+
+[project.urls]
+"Homepage" = "https://github.com/your_org/a-sys-i"
+"Bug Tracker" = "https://github.com/your_org/a-sys-i/issues"
+
+[project.optional-dependencies]
+hpc = [
+     "prometheus-client",
+     "opentelemetry-api",
+     "opentelemetry-sdk",
+     "opentelemetry-exporter-otlp",
+     # "transformer-engine", # Nvidia specific, install manually if needed
+     # "nvcomp", # Nvidia specific, install manually if needed
+     "mpi4py", # If distributed setup considered
+]
+dev = [
+    "pytest",
+    "pytest-benchmark",
+    "pytest-cov",
+    "black",
+    "isort",
+    "flake8",
+    "mypy",
+    "pre-commit",
+     "types-PyYAML",
+     "types-tqdm",
+     "types-psutil",
+     "pandas-stubs",
+]
+# Alias to install all
+all = [
+   "a-sys-i[hpc,dev]"
+]
+
+
+[project.scripts]
+# Command Line Interface entry points
+asys-i-run = "scripts.run_experiment:app"
+asys-i-bench = "scripts.run_benchmark:app"
+
+[tool.setuptools]
+# Build C++ extension here or via setup.py / scikit-build-core
+# Example for basic setup, advanced CMake needed for cpp_ringbuffer
+# ext_modules = ...
+
+[tool.setuptools.packages.find]
+where = ["src"] # Look for packages only under src/
+
+# --- Development Tooling Configuration ---
+
+[tool.black]
+line-length = 88
+target-version = ['py39', 'py310', 'py311']
+include = '\.pyi?$'
+# extend-exclude = '''
+# '''
+
+[tool.isort]
+profile = "black"
+line_length = 88
+# multi_line_output = 3
+# include_trailing_comma = true
+# force_grid_wrap = 0
+# use_parentheses = true
+# ensure_newline_before_comments = true
+
+[tool.mypy]
+python_version = "3.10"
+mypy_path = "src"
+ignore_missing_imports = True # Allow gradual typing, ignore libs without stubs
+check_untyped_defs = True
+disallow_untyped_defs = False # Set to True for stricter checks later
+warn_unused_ignores = True
+warn_redundant_casts = True
+warn_unused_configs = True
+strict_optional = True
+# plugins = ["pydantic.mypy"] # Enable if using Pydantic plugin
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --benchmark-sort=mean"
+testpaths = [
+    "tests",
+]
+markers = [
+    "hpc: marks tests as requiring HPC environment/dependencies (deselect with '-m \"not hpc\"')",
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')"
+]
+filterwarnings = [
+     "ignore::DeprecationWarning",
+]
+
+# [tool.pydantic-mypy]
+# init_forbid_extra = True
+# init_typed = True
+# warn_required_dynamic_aliases = True
+

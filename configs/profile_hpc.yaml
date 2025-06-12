@@ -1,0 +1,67 @@
+# configs/profile_hpc.yaml: Configuration for high-performance clusters
+# (FINAL VERSION: simplified thanks to auto-detection)
+# Overrides base.yaml
+run_profile: HPC
+
+project:
+  output_dir: "./outputs/hpc_run" # Adapt this for your fast storage path e.g. "/mnt/fast_storage/asys_i/hpc_run_01"
+  log_dir: "./logs/hpc_run"
+  checkpoint_dir: "./checkpoints/hpc_run"
+  log_level: "INFO"
+
+hardware:
+   dtype: "bfloat16"
+   use_mixed_precision: true
+   compile_model: true # Use torch 2.0 compile if available
+
+ppo:
+   max_steps: 50000
+   batch_size: 128
+
+sae_model:
+   d_in: "auto" # Auto-detect from host model (e.g., gpt2 hidden_size=768)
+   d_sae: 3072 # 4x expansion. User can set this explicitly if not "auto"
+   
+sae_trainer:
+   num_workers: 4 # User should adapt this to their hardware CPU core count
+   batch_size: 8192
+   
+hook:
+  sampling_rate: 1.0 # Sample everything for high fidelity
+  gpu_kernel_mode: "NONE" # Set to "FP8", "TOP_K", "FP8_LZ4" if hardware/libraries allow
+  layers_to_hook: [0,1,2,3,4,5,6,7,8,9,10,11] # Example: all layers for a 12-layer model
+
+data_bus:
+  type: CPP_SHARDED_SPMC
+  buffer_size_per_shard: 524288 # Large buffer capacity per shard
+  num_shards: 8 # High parallelism, typically matches number of trainers/GPUs or layers
+  shared_memory_size_gb: 32.0 # Allocate 32 GB shared memory for activations
+
+monitor:
+  type: PROMETHEUS
+  prometheus_port: 8001
+  heartbeat_check_interval_sec: 15
+  component_timeout_sec: 60 # Stricter timeout for HPC
+
+archiver:
+   enabled: false # Often disabled in HPC for max training throughput, rely on separate archiving
+   batch_size: 8192 # If enabled, use large batches
+
+resource_manager:
+   apply_bindings: true # Enable CPU/NUMA binding
+   allocation_strategy: "auto" # Intelligent auto-allocation of CPU cores
+   # For maximum performance or specific NUMA layout, experts can override with 'manual':
+   # cpu_affinity_map: 
+   #    "trainer_worker_0": [0, 1]
+   #    "trainer_worker_1": [2, 3]
+   #    "trainer_worker_2": [4, 5]
+   #    "trainer_worker_3": [6, 7]
+   #    "archiver_worker_0": [8]
+   #    "host_process": [10, 11, 12, 13, 14, 15] # PPO process
+   # numa_node_map:
+   #    "trainer_worker_0": 0
+   #    "trainer_worker_1": 0
+   #    "trainer_worker_2": 1
+   #    "trainer_worker_3": 1
+   #    "host_process": 0 
+

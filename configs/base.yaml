@@ -1,0 +1,54 @@
+# configs/base.yaml: Common default configurations
+# (FINAL VERSION)
+# Overridden by specific profiles
+
+project:
+  name: "asys-i-default"
+  output_dir: "./outputs/default"
+  log_dir: "./logs/default"
+  checkpoint_dir: "./checkpoints/default"
+  log_level: "INFO"
+  seed: 42
+
+hardware:
+  device: "cuda:0"
+  dtype: "float32" # Default to safer float32
+  use_mixed_precision: false
+  compile_model: false
+
+ppo:
+   model_name: "gpt2"
+   max_steps: 500 # short run by default
+
+sae_model:
+   d_in: "auto" # Auto-detect from host model
+   d_sae: 3072 # 4x expansion (can be configured)
+   l1_coefficient: 0.001
+
+sae_trainer:
+   learning_rate: 0.0003
+   batch_size: 2048
+   num_workers: 1
+   save_interval_steps: 5000
+   
+hook:
+   layers_to_hook: [3, 6, 9]
+   sampling_rate: 0.5 # Default moderate sampling
+   gpu_kernel_mode: "NONE"
+
+# Defaults will be set by config_loader based on run_profile if not specified
+# data_bus: 
+#  buffer_size_per_shard: 65536 
+#  num_shards: 1 
+
+# monitor:
+#   component_timeout_sec: 120
+
+archiver:
+   enabled: false # Disable by default
+   batch_size: 4096
+
+resource_manager:
+    apply_bindings: false # Off by default
+    allocation_strategy: "auto" # Auto-allocate if apply_bindings is true
+

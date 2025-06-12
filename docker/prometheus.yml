@@ -1,0 +1,10 @@
+# prometheus.yml for docker-compose
+global:
+  scrape_interval: 15s 
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'asys-i-app'
+    static_configs:
+      # 'app' is the service name in docker-compose, port exposed by PrometheusMonitor
+      - targets: ['app:8001'] 
