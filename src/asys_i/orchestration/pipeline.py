@@ -9,6 +9,7 @@ High Cohesion: System lifecycle management.
 import logging
 import time
 import multiprocessing
+from multiprocessing.managers import BaseManager, DictProxy
 import threading
 import os
 from typing import Dict, Any, Optional
@@ -31,33 +32,15 @@ from asys_i.monitoring.watchdog import Watchdog
 
 log = logging.getLogger(__name__)
 
-# Shared dictionary for heartbeats across processes for watchdog thread
-# Must be created in the main process before forking/spawning
-HEARTBEAT_MANAGER = multiprocessing.Manager()
-SHARED_HEARTBEATS = HEARTBEAT_MANAGER.dict()
-
-# Monkey-patch BaseMonitor to use shared dict
-# A bit hacky, but keeps interface clean and prevents circular dependencies if Monitor directly imported Managers
-def shared_heartbeat(self, component_id: ComponentID):
-      SHARED_HEARTBEATS[component_id] = time.time()
-      # log.debug(f"Heartbeat from {component_id} via shared dict") # Noisy
-      # Call original logic too if it exists and does more (e.g. log metric)
-      if hasattr(self, '_original_heartbeat'):
-           self._original_heartbeat(component_id)
-
-def get_shared_heartbeats(self) -> Dict[ComponentID, float]:
-       return SHARED_HEARTBEATS.copy()
-       
-def register_shared_component(self, component_id: ComponentID):
-      if component_id not in SHARED_HEARTBEATS:
-          log.info(f"Registering component for heartbeat monitoring: {component_id}")
-          self.heartbeat(component_id)
-
+# Global signal handler - this can stay if it's genuinely global for process termination
+_stop_event_global = multiprocessing.Event() # TODO: Review if this is still needed or should be instance member
 
 class ExperimentPipeline:
     """ Orchestrates the entire experiment lifecycle. """
     def __init__(self, config: MasterConfig):
         self.config = config
+        self.heartbeat_manager: Optional[BaseManager] = None
+        self.shared_heartbeats_dict: Optional[DictProxy] = None
         self.monitor: Optional[BaseMonitor] = None
         self.data_bus: Optional[BaseDataBus] = None
         self.ppo_host: Optional[PPOHostProcess] = None
@@ -70,13 +53,8 @@ class ExperimentPipeline:
         self._is_setup = False
         self._is_shutting_down = False
         
-        # Apply patch for shared heartbeats BEFORE creating monitor
-        if not hasattr(BaseMonitor, '_original_heartbeat'):
-             BaseMonitor._original_heartbeat = BaseMonitor.heartbeat # type: ignore
-        BaseMonitor.heartbeat = shared_heartbeat # type: ignore
-        BaseMonitor.get_heartbeats = get_shared_heartbeats # type: ignore
-        BaseMonitor.register_component = register_shared_component # type: ignore
-        log.info("BaseMonitor patched for shared heartbeats across processes.")
+        # Manager and shared dict are created in setup() to ensure it's in the main process context
+        # before other processes might be spawned.
 
     def _resolve_auto_configs(self):
         """
@@ -88,6 +66,7 @@ class ExperimentPipeline:
         # 1. Auto-detect d_in for SAE
         if self.config.sae_model.d_in == "auto":
             assert self.ppo_host, "PPOHost must be initialized before auto-detecting d_in"
+            assert self.monitor is not None, "Monitor must be initialized before resolving auto configs"
             host_model = self.ppo_host.get_model()
             detected_dim = -1
             try:
@@ -129,6 +108,7 @@ class ExperimentPipeline:
             res_config.allocation_strategy == "auto" and 
             not res_config.cpu_affinity_map): # Only auto-generate if no map provided
             
+            assert self.monitor is not None, "Monitor must be initialized before resolving auto configs"
             if not os.name == 'posix' or not hasattr(psutil, 'cpu_count'):
                 log.warning("Auto CPU affinity requires Linux and psutil. Skipping auto-binding.")
                 self.monitor.log_metric("resource_binding_auto_skip", 1, tags={"reason": "not_linux_or_psutil"})
@@ -144,15 +124,9 @@ class ExperimentPipeline:
             num_trainers = self.config.sae_trainer.num_workers
             num_archivers = 1 if self.config.archiver.enabled else 0 # Assume one archiver worker
             
-            # Heuristic for core allocation:
-            # Try to reserve 1-2 cores for system/main pipeline, 1 for archiver if enabled, rest for trainers.
-            # This is a basic strategy; for NUMA-aware systems, more sophisticated logic is needed.
-            
-            # Start with all available cores
             remaining_cores = list(range(num_logical_cores))
-            core_map = {}
+            core_map: Dict[ComponentID, List[int]] = {} # Ensure type for core_map
             
-            # Assign Host Process (main pipeline thread runs here)
             host_min_cores = 1
             host_actual_cores = min(host_min_cores, len(remaining_cores))
             if host_actual_cores > 0:
@@ -160,7 +134,6 @@ class ExperimentPipeline:
                 remaining_cores = remaining_cores[host_actual_cores:]
                 log.debug(f"Assigned {host_actual_cores} cores to host_process: {core_map['host_process']}")
 
-            # Assign Archiver Worker
             if num_archivers > 0 and remaining_cores:
                 archiver_min_cores = 1
                 archiver_actual_cores = min(archiver_min_cores, len(remaining_cores))
@@ -169,18 +142,17 @@ class ExperimentPipeline:
                     remaining_cores = remaining_cores[archiver_actual_cores:]
                     log.debug(f"Assigned {archiver_actual_cores} cores to archiver_worker_0: {core_map['archiver_worker_0']}")
 
-            # Assign Trainer Workers
             if remaining_cores:
                 cores_per_trainer = max(1, len(remaining_cores) // num_trainers)
-                if cores_per_trainer == 0: # Not enough cores for at least 1 per trainer
+                if cores_per_trainer == 0:
                      log.warning(f"Not enough remaining cores ({len(remaining_cores)}) to assign at least 1 core per trainer. Trainers may share cores.")
-                     cores_per_trainer = 1 # Each trainer gets at least 1, will overlap
+                     cores_per_trainer = 1
                      
                 for i in range(num_trainers):
-                    worker_id = f"trainer_worker_{i}"
+                    worker_id: ComponentID = f"trainer_worker_{i}" # type: ignore
                     start_idx = i * cores_per_trainer
                     if start_idx >= len(remaining_cores):
-                         break # No more cores to assign
+                         break
                     
                     assigned_cores = remaining_cores[start_idx : min(start_idx + cores_per_trainer, len(remaining_cores))]
                     if assigned_cores:
@@ -206,62 +178,66 @@ class ExperimentPipeline:
         start_time = time.time()
         
         try:
-             # ORDER IS NOW CRITICAL FOR AUTO-CONFIG RESOLUTION
-             # 1. Monitor (dependency for all others)
-             self.monitor = create_monitor(self.config)
-             # Log full config (including "auto" values that will be resolved)
-             # The actual resolved values will be logged when each component binds/initializes
-             self.monitor.log_hyperparams(self.config.dict()) 
+            # 0. Initialize Heartbeat Manager & Shared Dictionary (must be done in main process)
+            log.info("Initializing Multiprocessing Manager for heartbeats in ExperimentPipeline setup...")
+            self.heartbeat_manager = multiprocessing.Manager()
+            assert self.heartbeat_manager is not None, "Heartbeat manager failed to initialize"
+            self.shared_heartbeats_dict = self.heartbeat_manager.dict()
+            assert self.shared_heartbeats_dict is not None, "Shared heartbeats dict failed to initialize"
 
-             # 2. Data Bus (dependency for hooker, trainer, archiver)
-             self.data_bus = create_data_bus(self.config, self.monitor)
+            # ORDER IS NOW CRITICAL FOR AUTO-CONFIG RESOLUTION
+            # 1. Monitor (dependency for all others - now receives the shared dict)
+            self.monitor = create_monitor(self.config, self.shared_heartbeats_dict)
+            self.monitor.log_hyperparams(self.config.dict())
 
-             # 3. Host Process (MUST be created before auto-config resolution for d_in)
-             self.ppo_host = PPOHostProcess(self.config, self.monitor, self.stop_event)
+            # 2. Data Bus (dependency for hooker, trainer, archiver)
+            self.data_bus = create_data_bus(self.config, self.monitor)
 
-             # 4. *** INTELLIGENCE UPGRADE STEP: RESOLVE "AUTO" CONFIGS ***
-             self._resolve_auto_configs()
+            # 3. Host Process (MUST be created before auto-config resolution for d_in)
+            self.ppo_host = PPOHostProcess(self.config, self.monitor, self.stop_event)
 
-             # 5. Hooker (now uses potentially updated d_in from config)
-             self.hooker = ActivationHooker(
-                  self.ppo_host.get_model(), self.config, self.data_bus, self.monitor
-             )
-             
-             all_layers = self.config.hook.layers_to_hook
-             if not all_layers:
-                 log.warning("No layers configured to hook. SAE training and archiving will be idle.")
+            # 4. *** INTELLIGENCE UPGRADE STEP: RESOLVE "AUTO" CONFIGS ***
+            self._resolve_auto_configs()
 
-             # 6. Trainer Manager (now uses fully resolved config, including d_in and cpu_affinity)
-             self.trainer_manager = SAETrainerManager(
-                  self.config, self.data_bus, self.monitor, self.stop_event, all_layers
-             )
-             self.trainer_manager.initialize()
+            # 5. Hooker (now uses potentially updated d_in from config)
+            self.hooker = ActivationHooker(
+                 self.ppo_host.get_model(), self.config, self.data_bus, self.monitor
+            )
 
-             # 7. Archiver Manager (now uses fully resolved config, including cpu_affinity)
-             self.archiver_manager = ArchiverManager(
-                   self.config, self.data_bus, self.monitor, self.stop_event, all_layers
-             )
-             self.archiver_manager.initialize()
+            all_layers = self.config.hook.layers_to_hook
+            if not all_layers:
+                log.warning("No layers configured to hook. SAE training and archiving will be idle.")
 
-             # 8. Watchdog (needs monitor and managers)
-             managed = {}
-             if self.trainer_manager: managed["trainer"] = self.trainer_manager
-             if self.archiver_manager: managed["archiver"] = self.archiver_manager
-             self.watchdog = Watchdog(
-                  self.monitor, self.config.monitor, managed_components=managed
-             )
-             # Register host with monitor so watchdog *could* see it (though it's not managed for restart)
-             self.monitor.register_component(self.ppo_host.component_id)
+            # 6. Trainer Manager (now uses fully resolved config, including d_in and cpu_affinity)
+            self.trainer_manager = SAETrainerManager(
+                 self.config, self.data_bus, self.monitor, self.stop_event, all_layers
+            )
+            self.trainer_manager.initialize()
 
-             self._is_setup = True
-             duration = time.time() - start_time
-             log.info(f">>> PIPELINE SETUP COMPLETE ({duration:.2f}s) <<<")
-             self.monitor.log_metric("pipeline_setup_duration_sec", duration)
+            # 7. Archiver Manager (now uses fully resolved config, including cpu_affinity)
+            self.archiver_manager = ArchiverManager(
+                 self.config, self.data_bus, self.monitor, self.stop_event, all_layers
+            )
+            self.archiver_manager.initialize()
+
+            # 8. Watchdog (needs monitor and managers)
+            managed_components_for_watchdog: Dict[str, Any] = {}
+            if self.trainer_manager: managed_components_for_watchdog["trainer"] = self.trainer_manager
+            if self.archiver_manager: managed_components_for_watchdog["archiver"] = self.archiver_manager
+            self.watchdog = Watchdog(
+                 self.monitor, self.config.monitor, managed_components=managed_components_for_watchdog
+            )
+            self.monitor.register_component(self.ppo_host.component_id)
+
+            self._is_setup = True
+            duration = time.time() - start_time
+            log.info(f">>> PIPELINE SETUP COMPLETE ({duration:.2f}s) <<<")
+            self.monitor.log_metric("pipeline_setup_duration_sec", duration)
 
         except Exception as e:
              log.exception("Error during pipeline setup:")
              if self.monitor: self.monitor.log_metric("pipeline_error_count", 1, tags={"stage": "setup"})
-             self.shutdown() # Clean up anything partially created
+             self.shutdown()
              raise
 
     def run(self):
@@ -273,31 +249,26 @@ class ExperimentPipeline:
          log.info(">>> PIPELINE RUN STARTED <<<")
          start_time = time.time()
          try:
-             assert self.watchdog and self.trainer_manager and self.archiver_manager and self.ppo_host
+             assert self.watchdog and self.trainer_manager and self.archiver_manager and self.ppo_host and self.hooker
              
              self.watchdog.start()
              self.trainer_manager.start_all()
              self.archiver_manager.start_all()
              
-             # --- Blocking Call ---
-             # Host loop runs in the main thread/process
              self.ppo_host.run_training_loop(self.hooker) 
-             # ---------------------
              
-             # If loop finishes normally, signal stop
              self.stop_event.set()
              
              duration = time.time() - start_time
              log.info(f">>> PIPELINE RUN FINISHED ({duration:.2f}s) <<<")
-             self.monitor.log_metric("pipeline_run_duration_sec", duration)
+             if self.monitor: self.monitor.log_metric("pipeline_run_duration_sec", duration)
              
          except Exception as e:
               log.exception("Error during pipeline run:")
               if self.monitor: self.monitor.log_metric("pipeline_error_count", 1, tags={"stage": "run"})
-              self.stop_event.set() # Ensure shutdown occurs
-              raise # Re-raise for script handler
+              self.stop_event.set()
+              raise
         
-
     def shutdown(self):
          if self._is_shutting_down:
               log.warning("Pipeline shutdown already in progress.")
@@ -305,29 +276,38 @@ class ExperimentPipeline:
          self._is_shutting_down = True
          log.info(">>> PIPELINE SHUTDOWN STARTED <<<")
          start_time = time.time()
-         self.stop_event.set() # Ensure all components receive stop signal
+         self.stop_event.set()
 
-         # Shutdown in reverse order of dependency/startup
          try:
             if self.ppo_host:       self.ppo_host.shutdown()
-            if self.hooker:         self.hooker.shutdown() # detach
+            if self.hooker:         self.hooker.shutdown()
             if self.archiver_manager: self.archiver_manager.stop_all()
             if self.trainer_manager:  self.trainer_manager.stop_all()
             if self.watchdog and self.watchdog.is_alive(): self.watchdog.stop()
-            # Give workers time to finish/flush after stop_event
             time.sleep(2) 
-            if self.data_bus:       self.data_bus.shutdown() # Release SHM!
-            if self.monitor:        self.monitor.shutdown() # Flush metrics!
-            SHARED_HEARTBEATS.clear()
-            # HEARTBEAT_MANAGER.shutdown() # Be careful shutting down manager, might kill other shared objects
+            if self.data_bus:       self.data_bus.shutdown()
+            if self.monitor:        self.monitor.shutdown()
+
+            if hasattr(self, 'heartbeat_manager') and self.heartbeat_manager:
+                log.info("Shutting down heartbeat_manager...")
+                # Check if manager process is alive before attempting shutdown
+                # This check might be platform-dependent or require checking _process attribute
+                try:
+                    if hasattr(self.heartbeat_manager, '_process') and self.heartbeat_manager._process.is_alive(): # type: ignore
+                        self.heartbeat_manager.shutdown()
+                    elif not hasattr(self.heartbeat_manager, '_process'): # For some manager types or if already shutdown
+                        # If we can't check _process, try shutdown if it seems valid
+                        # This path is less certain; direct shutdown might be okay if no active children
+                        self.heartbeat_manager.shutdown()
+                except Exception as e:
+                    log.error(f"Exception during heartbeat_manager shutdown: {e}")
+                self.heartbeat_manager = None
             
             duration = time.time() - start_time
             log.info(f">>> PIPELINE SHUTDOWN COMPLETE ({duration:.2f}s) <<<")
          except Exception as e:
               log.exception("Error during pipeline shutdown:")
-              # Monitor might be down, rely on logging
-              pass # Suppress further exceptions during shutdown
+              pass
 
          self._is_setup = False
          self._is_shutting_down = False
-

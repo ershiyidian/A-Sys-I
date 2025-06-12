@@ -35,11 +35,22 @@ def trainer_worker_process_target(
        stop_event: multiprocessing.Event,
        assigned_layer_indices: List[LayerIndex],
  ):
-      # Ensure GPU is visible/initialized correctly in child process
-      torch.cuda.init()
+      try:
+          # Ensure GPU is visible/initialized correctly in child process
+          if config.hardware.device != "cpu": # Only try to init CUDA if not already set to CPU
+            torch.cuda.init()
+      except RuntimeError as e:
+          if "Found no NVIDIA driver" in str(e) or "CUDA unavailable" in str(e).lower():
+              log.warning(f"SAETrainerWorker {worker_id}: CUDA init failed ({e}). Defaulting to CPU.")
+              config.hardware.device = "cpu" # Modify the config FOR THIS PROCESS
+          else:
+              log.error(f"SAETrainerWorker {worker_id}: Unexpected CUDA error: {e}")
+              config.hardware.device = "cpu" # Fallback to CPU on other CUDA errors too
+              # Potentially re-raise if it's not a driver/availability issue? For now, fallback.
+
       # Set seeds for reproducibility in child process
-      torch.manual_seed(config.project.get("seed", 42) + hash(worker_id) % (2**32))
-      np.random.seed(config.project.get("seed", 42) + hash(worker_id) % (2**32))
+      torch.manual_seed(config.project.seed + hash(worker_id) % (2**32))
+      np.random.seed(config.project.seed + hash(worker_id) % (2**32))
       
       worker = SAETrainerWorker(worker_id, config, data_bus, monitor, stop_event, assigned_layer_indices)
       try:

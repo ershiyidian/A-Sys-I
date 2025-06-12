@@ -1,7 +1,7 @@
- # src/asys_i/monitoring/watchdog.py
- """
- Core Philosophy: Design for Failure, Observability-First.
- Monitors component heartbeats and triggers restart actions for failed components.
+# src/asys_i/monitoring/watchdog.py
+"""
+Core Philosophy: Design for Failure, Observability-First.
+Monitors component heartbeats and triggers restart actions for failed components.
  Runs in a separate thread.
  """
 import logging

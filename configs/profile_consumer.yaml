@@ -25,12 +25,12 @@ hook:
 
 # Explicitly set types for clarity, though config_loader defaults correctly
 data_bus:
-  type: PYTHON_QUEUE
+  type: python_queue
   buffer_size_per_shard: 10000 # Smaller buffer for consumer
   num_shards: 1 # PythonQueue does not support sharding
 
 monitor:
-  type: CSV_TENSORBOARD
+  type: csv_tensorboard
   heartbeat_check_interval_sec: 45
   component_timeout_sec: 120
 

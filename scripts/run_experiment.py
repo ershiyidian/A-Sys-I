@@ -7,6 +7,7 @@ import signal
 import sys
 import typer
 from typing import Optional
+import multiprocessing
 # Add src to path if running script directly without pip install -e
 sys.path.append('.') 
  

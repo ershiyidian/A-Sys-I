@@ -200,16 +200,16 @@ class ActivationHooker:
                          push_latency = (time.perf_counter() - push_start) * 1000
                          self.monitor.log_metric("hook_push_latency_ms", push_latency, tags=tags)
 
-                 # --- CONSUMER Path: Simple CPU Copy ---
-                 else:
-                      # Simple detach and move to CPU
-                      cpu_tensor = tensor_detached.to(device='cpu', non_blocking=True)
-                      packet_data = cpu_tensor
-                      packet = create_activation_packet(layer_idx, step, packet_data, self.profile, meta)
-                      push_start = time.perf_counter()
-                      success = self.data_bus.push(packet)
-                      push_latency = (time.perf_counter() - push_start) * 1000
-                      self.monitor.log_metric("hook_push_latency_ms", push_latency, tags=tags)
+                # --- CONSUMER Path: Simple CPU Copy ---
+                else:
+                     # Simple detach and move to CPU
+                     cpu_tensor = tensor_detached.to(device='cpu', non_blocking=True)
+                     packet_data = cpu_tensor
+                     packet = create_activation_packet(layer_idx, step, packet_data, self.profile, meta)
+                     push_start = time.perf_counter()
+                     success = self.data_bus.push(packet)
+                     push_latency = (time.perf_counter() - push_start) * 1000
+                     self.monitor.log_metric("hook_push_latency_ms", push_latency, tags=tags)
                 
                 self._handle_backpressure(success)
                 if success:

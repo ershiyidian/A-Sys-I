@@ -1,12 +1,12 @@
- # src/asys_i/monitoring/monitor_hpc.py
- """
- Core Philosophy: Predictability (Performance), Observability-First.
- HPC mode monitor implementation using Prometheus.
- Low-overhead, pull-based metrics system.
- """
+# src/asys_i/monitoring/monitor_hpc.py
+"""
+Core Philosophy: Predictability (Performance), Observability-First.
+HPC mode monitor implementation using Prometheus.
+Low-overhead, pull-based metrics system.
+"""
 import logging
 import time
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, List
 from threading import Lock
 
 # HPC specific imports
@@ -56,7 +56,8 @@ class PrometheusMonitor(BaseMonitor):
      """
      def __init__(self,
                   monitor_config: MonitorConfig,
-                  project_config: ProjectConfig):
+                  project_config: ProjectConfig,
+                  shared_heartbeats_dict: dict):
          
          if not HPC_PROM_AVAIL:
               # We must fail fast if the dependency isn't met
@@ -66,7 +67,7 @@ class PrometheusMonitor(BaseMonitor):
               )
          # check_hpc_prerequisites() # Call this if other HPC deps are mandatory
               
-         super().__init__(monitor_config, project_config)
+         super().__init__(monitor_config, project_config, shared_heartbeats_dict)
          self._metrics_cache: Dict[str, Union[Gauge, Counter, Histogram, Summary]] = {}
          self._lock = Lock() # Protect metric cache creation
          self._server_started = False
@@ -221,3 +222,31 @@ class PrometheusMonitor(BaseMonitor):
          with self._lock:
               self._metrics_cache.clear()
 
+     def __getstate__(self):
+          state = self.__dict__.copy()
+          # Remove unpickleable entries
+          if '_lock' in state:
+               del state['_lock']
+          if '_metrics_cache' in state: # Prometheus metric objects are not meant to be pickled
+               del state['_metrics_cache']
+          if '_heartbeat_gauge' in state: # This will be recreated
+               del state['_heartbeat_gauge']
+          # Server is not owned by child processes
+          state['_server_started'] = False
+          return state
+
+     def __setstate__(self, state):
+          self.__dict__.update(state)
+          # Re-initialize unpickleable entries
+          self._lock = Lock()
+          self._metrics_cache = {} # Child gets its own cache
+          # Re-define heartbeat gauge for this instance if needed
+          if PROMETHEUS_AVAILABLE: # Ensure it's only done if prometheus is available
+               self._heartbeat_gauge = self._get_or_create_metric(
+                    "component_heartbeat_timestamp_seconds",
+                    "Timestamp of the last heartbeat received from a component",
+                    ["component"],
+                    Gauge
+               )
+          else:
+               self._heartbeat_gauge = None

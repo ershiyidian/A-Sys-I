@@ -9,6 +9,7 @@ import os
 import time
 import threading
 from typing import Any, Dict, Optional, List
+import torch
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -39,8 +40,9 @@ class LoggingCSVTensorBoardMonitor(BaseMonitor):
     """
     def __init__(self,
                  monitor_config: MonitorConfig,
-                 project_config: ProjectConfig):
-        super().__init__(monitor_config, project_config)
+                 project_config: ProjectConfig,
+                 shared_heartbeats_dict: dict):
+        super().__init__(monitor_config, project_config, shared_heartbeats_dict)
         self.log_dir = os.path.join(project_config.log_dir, project_config.name)
         os.makedirs(self.log_dir, exist_ok=True)
         
@@ -64,6 +66,46 @@ class LoggingCSVTensorBoardMonitor(BaseMonitor):
             log.warning("TensorBoard writer is not available.")
         
         self._last_flush = time.time()
+
+    def __getstate__(self):
+        """Prepare the object for pickling. Exclude unpickleable attributes."""
+        state = self.__dict__.copy()
+        del state['_lock']
+        del state['_csv_file']
+        del state['_csv_writer']
+        if '_writer' in state: # Tensorboard writer
+            del state['_writer']
+        # Store paths and other config needed to re-initialize
+        state['_csv_path_for_pickle'] = self._csv_file.name if hasattr(self, '_csv_file') and self._csv_file else None
+        state['_tb_log_dir_for_pickle'] = self._writer.log_dir if hasattr(self, '_writer') and self._writer else None
+        return state
+
+    def __setstate__(self, state):
+        """Re-initialize unpickleable attributes after unpickling."""
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+
+        # Re-open CSV file
+        csv_path = state.get('_csv_path_for_pickle')
+        if csv_path:
+            self._csv_file = open(csv_path, 'a', newline='')
+            self._csv_writer = csv.writer(self._csv_file)
+            self._csv_header_written = os.path.getsize(csv_path) > 0 # Recheck header
+        else: # Should not happen if correctly pickled from an initialized object
+            self._csv_file = None
+            self._csv_writer = None
+            self._csv_header_written = False
+
+        # Re-initialize TensorBoard writer
+        tb_log_dir = state.get('_tb_log_dir_for_pickle')
+        if TENSORBOARD_AVAILABLE and tb_log_dir:
+            self._writer = SummaryWriter(log_dir=tb_log_dir)
+        else:
+            self._writer = None
+
+        # Remove helper pickle fields
+        if '_csv_path_for_pickle' in self.__dict__: del self.__dict__['_csv_path_for_pickle']
+        if '_tb_log_dir_for_pickle' in self.__dict__: del self.__dict__['_tb_log_dir_for_pickle']
 
 
     def _format_tag_key(self, name:str, tags: Optional[Dict[str,Any]]) -> str:
