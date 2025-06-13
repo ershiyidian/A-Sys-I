@@ -1,5 +1,6 @@
-import tomli
 import sys
+
+import tomli
 
 try:
     with open("pyproject.toml", "rb") as f:
