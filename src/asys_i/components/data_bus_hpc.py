@@ -1,384 +1,154 @@
-# src/asys_i/components/data_bus_hpc.py
-"""
-Core Philosophy: Predictability (Performance).
-HPC mode data bus implementation: Python wrapper for C++ shared-memory ring buffer.
-Achieves high throughput via zero-copy (shared mem) and lock-free mechanisms, avoiding GIL.
-"""
+// src/asys_i/components/data_bus_hpc.py (REWRITTEN)
 import logging
+import multiprocessing
 import multiprocessing.shared_memory
-import os # Added import for os.getpid()
+import os
 import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
 
-# HPC specific conditional imports
-try:
-    # This is the name defined in PYBIND11_MODULE
-    # import asys_i.hpc.cpp_ringbuffer_bindings as cpp_backend
-    # Simulate backend for structure
-    class MockCppQueue:
-        def __init__(self, size):
-            self._q = []
-            self._size = size
-
-        def push(self, item, timeout):
-            if len(self._q) < self._size:
-                self._q.append(item)
-                return True
-            return False
-
-        def pop(self, timeout):
-            return self._q.pop(0) if self._q else None
-
-        def size(self):
-            return len(self._q)
-
-    class MockCppBackend:
-        def SPMCQueue(self, size):
-            return MockCppQueue(size)
-
-    cpp_backend = MockCppBackend()
-    CPP_AVAILABLE = True  # SIMULATION
-except ImportError:
-    cpp_backend = None
-    CPP_AVAILABLE = False
-
 from asys_i.common.types import (
-    ActivationPacket,
-    ConsumerID,
-    LayerIndex,
-    RunProfile,
-    TensorRef,
+    ActivationPacket, ComponentID, TensorRef, RunProfile, calculate_checksum,
+    DTYPE_TO_CODE_MAP, CODE_TO_DTYPE_MAP
 )
 from asys_i.components.data_bus_interface import BaseDataBus
-from asys_i.hpc import CPP_EXTENSION_AVAILABLE, check_hpc_prerequisites
+from asys_i.hpc import c_ext_wrapper, SHM_NAME_PREFIX, MQ_NAME_PREFIX
 from asys_i.monitoring.monitor_interface import BaseMonitor
-from asys_i.orchestration.config_loader import MasterConfig  # Added MasterConfig
+from asys_i.orchestration.config_loader import MasterConfig
 
 log = logging.getLogger(__name__)
 
-# Define a structure matching the C++ packet metadata if necessary
-# PacketMeta = Dict[str, Any]
-
-
-class SharedMemoryManager:
-    """Manages tensor storage in shared memory"""
-
-    def __init__(self, name: str, size_bytes: int, monitor: BaseMonitor):
-        self.monitor = monitor
-        self.name = name
-        try:
-            # Create new block
-            self.shm = multiprocessing.shared_memory.SharedMemory(
-                name=name, create=True, size=size_bytes
-            )
-            log.info(f"Created shared memory '{name}' of size {size_bytes/1e9:.2f} GB")
-            self.owner = True
-        except FileExistsError:
-            # Attach to existing block (e.g., worker processes)
-            self.shm = multiprocessing.shared_memory.SharedMemory(
-                name=name, create=False
-            )
-            log.info(f"Attached to existing shared memory '{name}'")
-            self.owner = False
-        # TODO: Implement sophisticated allocation/free list/ref counting
-        self._next_offset = 0
-        self.size_bytes = size_bytes
-
-    def put_tensor(self, tensor: torch.Tensor) -> Optional[TensorRef]:
-        """Copy tensor to shared memory and return ref: 'offset:size:dtype:shape'"""
-        # Must be contiguous CPU tensor
-        tensor_cpu = tensor.detach().contiguous().cpu()
-        tensor_bytes = tensor_cpu.numpy().nbytes
-
-        if self._next_offset + tensor_bytes > self.size_bytes:
-            self.monitor.log_metric("data_bus_shm_full_count", 1)
-            log.error("Shared memory full!")
-            # TODO: handle wrapping or reallocation
-            return None
-
-        # View SHM buffer as numpy array and copy
-        shm_array = np.ndarray(
-            tensor_cpu.shape,
-            dtype=tensor_cpu.numpy().dtype,
-            buffer=self.shm.buf[self._next_offset : self._next_offset + tensor_bytes],
-        )
-        shm_array[:] = tensor_cpu.numpy()[:]
-
-        ref = f"{self._next_offset}:{tensor_bytes}:{str(tensor.dtype)}:{'-'.join(map(str, tensor.shape))}"
-        self._next_offset += tensor_bytes
-        self.monitor.log_metric("data_bus_shm_usage_bytes", self._next_offset)
-        return ref
-
-    def get_tensor(self, ref: TensorRef) -> torch.Tensor:
-        """Reconstruct tensor from shared memory reference"""
-        try:
-            offset_s, size_s, dtype_s, shape_s = ref.split(":")
-            offset, size = int(offset_s), int(size_s)
-            # Map torch dtype str to numpy dtype
-            torch_dtype = eval(
-                dtype_s.replace("torch.", "torch.")
-            )  # e.g. "torch.float32"
-            np_dtype = torch.empty(0, dtype=torch_dtype).numpy().dtype
-            shape = tuple(map(int, shape_s.split("-")))
-
-            # Create numpy view on the buffer
-            shm_array = np.ndarray(
-                shape, dtype=np_dtype, buffer=self.shm.buf[offset : offset + size]
-            )
-            # Create torch tensor from numpy view (zero-copy on CPU)
-            tensor = torch.from_numpy(
-                shm_array
-            )  # .clone() # clone if modification is expected
-            return tensor
-        except Exception as e:
-            log.error(f"Failed to reconstruct tensor from ref '{ref}': {e}")
-            raise
-
-    def close(self):
-        self.shm.close()
-        if self.owner:
-            try:
-                self.shm.unlink()  # Release memory block only if we created it
-                log.info(f"Unlinked shared memory '{self.name}'")
-            except FileNotFoundError:
-                pass  # already unlinked
-
-
 class CppShardedSPMCBus(BaseDataBus):
-    """
-    HPC Mode Data Bus:
-    - Uses multiple C++ SPMC lock-free ring buffers (shards).
-    - Tensor data stored in Python shared_memory, only metadata+TensorRef in C++ queue.
-    - Data assigned to shard based on layer_idx % num_shards.
-    - Consumers subscribe to specific shards.
-    """
-
-    def __init__(
-        self,
-        master_config: MasterConfig,  # Changed parameter name and type
-        monitor: BaseMonitor,
-    ):
-        bus_specific_config = master_config.data_bus  # Extract DataBusConfig
-        # Fail fast if C++ extension is not available
-        # if not CPP_EXTENSION_AVAILABLE or cpp_backend is None:
-        #     check_hpc_prerequisites() # Raises ImportError
-        if master_config.run_profile != RunProfile.HPC:  # Use master_config here
-            log.warning("CppShardedSPMCBus initialized but run_profile is not HPC!")
-
-        super().__init__(
-            bus_specific_config, monitor
-        )  # Pass the extracted DataBusConfig
-        self.num_shards = bus_specific_config.num_shards  # Use extracted config
-        self.shards: List[Any] = []
-        self.consumer_map: Dict[ConsumerID, List[int]] = (
-            {}
-        )  # Map consumer_id to list of shard indices
-        self.consumer_shard_cursor: Dict[ConsumerID, int] = (
-            {}
-        )  # For round-robin pulling
-
-        shm_name = f"asys_i_shm_{os.getpid()}_{int(time.time())}"
-        shm_size = int(
-            bus_specific_config.shared_memory_size_gb * 1e9
-        )  # Use extracted config
-        self.memory_manager = SharedMemoryManager(shm_name, shm_size, monitor)
-
-        log.info(
-            f"Initializing {self.num_shards} C++ SPMC shards with capacity {bus_specific_config.buffer_size_per_shard} each."
-        )  # Use extracted config
-        for i in range(self.num_shards):
-            # Pass the buffer size to C++ constructor
-            # queue = cpp_backend.SPMCQueue(bus_specific_config.buffer_size_per_shard)
-            queue = MockCppQueue(
-                bus_specific_config.buffer_size_per_shard
-            )  # SIMULATION
-            self.shards.append(queue)
-
-        self._is_ready = True
-        log.warning(
-            "!!! CppShardedSPMCBus is RUNNING IN SIMULATION MODE (Mock C++ Backend) !!!"
+    def __init__(self, master_config: MasterConfig, monitor: BaseMonitor):
+        super().__init__(master_config.data_bus, monitor)
+        self.master_config = master_config
+        
+        instance_id = f"{os.getpid()}_{int(time.time_ns() / 1000)}"
+        self.tensor_shm_name = f"{SHM_NAME_PREFIX}tensor_{instance_id}"
+        self.mq_name = f"{MQ_NAME_PREFIX}mq_{instance_id}"
+        
+        log.info(f"Creating HPC DataBus. SHM: {self.tensor_shm_name}, MQ: {self.mq_name}")
+        self.cpp_manager = c_ext_wrapper.ShmManager(
+            self.tensor_shm_name, self.mq_name,
+            int(self.config.shared_memory_size_gb * 1024 * 1024 * 1024),
+            self.config.buffer_size_per_shard, create=True
         )
+        if not self.cpp_manager.is_valid():
+            raise RuntimeError("Failed to initialize C++ ShmManager.")
 
-    def _get_shard_idx(self, layer_idx: LayerIndex) -> int:
-        return layer_idx % self.num_shards
+        self._tensor_data_shm_obj = multiprocessing.shared_memory.SharedMemory(name=self.tensor_shm_name, create=False)
+        
+        self.consumer_map: Dict[ComponentID, int] = {} # consumer_id -> consumer_shm_id
+        self._is_ready = True
+        log.info("CppShardedSPMCBus initialized and ready.")
 
     def push(self, packet: ActivationPacket, timeout: Optional[float] = None) -> bool:
-        if not self._is_ready:
+        if not self._is_ready or not isinstance(packet.data, torch.Tensor): return False
+
+        tensor = packet.data
+        tensor_cpu_numpy = tensor.contiguous().cpu().numpy()
+        
+        checksum = calculate_checksum(tensor_cpu_numpy.tobytes()) if self.config.use_checksum else 0
+        dtype_code_val = DTYPE_TO_CODE_MAP.get(tensor.dtype)
+        if dtype_code_val is None:
+            log.error(f"Unsupported dtype for HPC bus: {tensor.dtype}"); return False
+        
+        dtype_code = c_ext_wrapper.TorchDtypeCode(dtype_code_val)
+
+        success = self.cpp_manager.push(
+            tensor_numpy_array=tensor_cpu_numpy, dtype_code=dtype_code,
+            checksum=checksum, layer_idx_numeric=packet.layer_idx_numeric,
+            global_step=packet.global_step
+        )
+
+        tags = {"bus_type": "cpp_spmc"}
+        if not success:
+            self.monitor.log_metric("data_bus_drop_count", 1, {**tags, "reason": "cpp_push_fail"})
             return False
+        
+        self.monitor.log_metric("data_bus_push_count", 1, tags=tags)
+        return True
+        
+    def pull_batch(self, consumer_id: ComponentID, batch_size: Optional[int] = None, timeout: Optional[float] = None) -> List[ActivationPacket]:
+        if not self._is_ready: return []
+            
+        effective_batch_size = batch_size or self.config.pull_batch_size_max
+        cpp_metadata_list = self.cpp_manager.pull_batch(effective_batch_size)
+        if not cpp_metadata_list: return []
 
-        # 1. Store tensor in shared memory
-        if not isinstance(packet["data"], torch.Tensor):
-            log.error(f"HPC Bus expects torch.Tensor data, got {type(packet['data'])}")
-            return False
-        tensor_ref = self.memory_manager.put_tensor(packet["data"])
-        if tensor_ref is None:
-            # Shared memory full is a form of backpressure
-            self.monitor.log_metric(
-                "data_bus_drop_count", 1, tags={"reason": "shm_full"}
-            )
-            return False
-
-        # 2. Create metadata packet for C++ queue
-        meta_packet = packet.copy()
-        meta_packet["data"] = tensor_ref  # Replace Tensor with TensorRef
-
-        # 3. Select shard and push
-        shard_idx = self._get_shard_idx(packet["layer_idx"])
-        shard = self.shards[shard_idx]
-        effective_timeout = (
-            timeout if timeout is not None else self.config.push_timeout_sec
-        )
-        tags = {"shard": shard_idx, "bus_type": "cpp_sharded"}
-
-        start_time = time.perf_counter()
-        # success = shard.push(meta_packet, effective_timeout) # Actual C++ call
-        success = shard.push(meta_packet, effective_timeout)  # SIMULATION
-
-        if success:
-            latency = (time.perf_counter() - start_time) * 1000
-            self.monitor.log_metric("data_bus_push_latency_ms", latency, tags=tags)
-            self.monitor.log_metric("data_bus_push_count", 1, tags=tags)
-            self.monitor.log_metric(
-                "data_bus_queue_depth", shard.size(), tags=tags
-            )  # SIMULATION
-            return True
-        else:
-            self.monitor.log_metric(
-                "data_bus_drop_count", 1, tags={**tags, "reason": "queue_full"}
-            )
-            self.monitor.log_metric(
-                "data_bus_queue_depth", shard.size(), tags=tags
-            )  # SIMULATION
-            log.debug(f"DataBus Shard {shard_idx} is full. Dropping packet.")
-            return False  # Backpressure signal
-
-    def pull_batch(
-        self,
-        consumer_id: ConsumerID,
-        batch_size: Optional[int] = None,
-        timeout: Optional[float] = None,
-    ) -> List[ActivationPacket]:
-        if not self._is_ready:
-            return []
-        if consumer_id not in self.consumer_map:
-            log.error(f"Consumer {consumer_id} not registered. Cannot pull.")
-            return []
-
-        effective_batch_size = (
-            batch_size if batch_size is not None else self.config.pull_batch_size_max
-        )
-        effective_timeout = (
-            timeout if timeout is not None else self.config.pull_timeout_sec
-        )
-        batch: List[ActivationPacket] = []
-        meta_batch: List[ActivationPacket] = []
-        tags = {"consumer": consumer_id, "bus_type": "cpp_sharded"}
-
-        assigned_shards_idx = self.consumer_map[consumer_id]
-        if not assigned_shards_idx:
-            return []
-
-        start_time = time.time()
-
-        # Round-robin over assigned shards to ensure fairness
-        start_cursor = self.consumer_shard_cursor.get(consumer_id, 0)
-
-        packets_per_shard = max(1, effective_batch_size // len(assigned_shards_idx))
-
-        shards_checked = 0
-        current_cursor = start_cursor
-        while len(meta_batch) < effective_batch_size and shards_checked < len(
-            assigned_shards_idx
-        ):
-            if time.time() - start_time > effective_timeout:
-                break
-
-            shard_idx = assigned_shards_idx[current_cursor % len(assigned_shards_idx)]
-            shard = self.shards[shard_idx]
-
-            pulled_from_shard = 0
-            while (
-                pulled_from_shard < packets_per_shard
-                and len(meta_batch) < effective_batch_size
-            ):
-                # Use very short timeout for pop, main timeout is controlled by loop
-                # meta_packet = shard.pop(timeout=0.001) # Actual C++ call
-                meta_packet = (
-                    shard.pop(timeout=0.001) if shard.size() > 0 else None
-                )  # SIMULATION
-                if meta_packet:
-                    meta_batch.append(meta_packet)
-                    pulled_from_shard += 1
-                else:
-                    break  # Shard empty or timeout
-
-            current_cursor += 1
-            shards_checked += 1  # Ensure we don't loop forever if all shards empty
-
-        # Update cursor for next pull
-        self.consumer_shard_cursor[consumer_id] = current_cursor % len(
-            assigned_shards_idx
-        )
-
-        # Reconstruct Tensors
-        for meta_packet in meta_batch:
+        reconstructed_packets: List[ActivationPacket] = []
+        for cpp_meta in cpp_metadata_list:
             try:
-                tensor_ref = meta_packet["data"]
-                if isinstance(tensor_ref, TensorRef):
-                    tensor = self.memory_manager.get_tensor(tensor_ref)
-                    full_packet = meta_packet.copy()
-                    full_packet["data"] = tensor
-                    batch.append(full_packet)
-                    # TODO: Signal memory manager to free/decrement ref count for tensor_ref
-                else:
-                    log.error(f"Packet data is not a TensorRef: {type(tensor_ref)}")
+                tensor_ref = TensorRef(
+                    shm_data_offset=cpp_meta.shm_data_offset,
+                    data_size_bytes=cpp_meta.data_size_bytes,
+                    dtype_code=int(cpp_meta.dtype_code),
+                    ndim=cpp_meta.ndim, shape=tuple(cpp_meta.shape),
+                    checksum=cpp_meta.checksum
+                )
+                packet = ActivationPacket(
+                    layer_name=f"layer_idx_{cpp_meta.layer_idx_numeric}",
+                    layer_idx_numeric=cpp_meta.layer_idx_numeric,
+                    global_step=cpp_meta.global_step,
+                    data=tensor_ref, profile=self.master_config.run_profile,
+                    timestamp_ns=cpp_meta.timestamp_ns, meta={}
+                )
+                reconstructed_packets.append(packet)
             except Exception as e:
-                log.error(
-                    f"Failed to reconstruct tensor for consumer {consumer_id}: {e}"
-                )
-                self.monitor.log_metric(
-                    "data_bus_error_count", 1, tags={**tags, "type": "reconstruct"}
-                )
+                log.error(f"Failed to process C++ PacketMetadata: {e}")
+                self.monitor.log_metric("data_bus_packet_conversion_error", 1)
+        
+        self.monitor.log_metric("data_bus_pull_count", len(reconstructed_packets), {"consumer_id": consumer_id})
+        return reconstructed_packets
 
-        if batch:
-            latency = (time.time() - start_time) * 1000
-            self.monitor.log_metric("data_bus_pull_latency_ms", latency, tags=tags)
-            self.monitor.log_metric("data_bus_pull_count", len(batch), tags=tags)
-            # Monitor depth per shard is tricky here, maybe log push/pull rates per shard instead
-
-        return batch
-
-    def register_consumer(
-        self, consumer_id: ConsumerID, layer_indices: List[LayerIndex]
-    ) -> None:
-        """Assign shards to a consumer based on the layers it's responsible for."""
-        assigned_shards = sorted(
-            list(set(self._get_shard_idx(idx) for idx in layer_indices))
-        )
-        self.consumer_map[consumer_id] = assigned_shards
-        self.consumer_shard_cursor[consumer_id] = 0
-        log.info(
-            f"Consumer {consumer_id} registered for layers {layer_indices}, assigned to shards: {assigned_shards}"
-        )
-        self.monitor.log_metric("data_bus_registered_consumers", len(self.consumer_map))
+    def register_consumer(self, consumer_id: ComponentID, layer_indices_numeric: List[int]) -> None:
+        consumer_shm_id = self.cpp_manager.register_consumer()
+        if consumer_shm_id == -1:
+            raise RuntimeError(f"Failed to register consumer {consumer_id}: max consumers reached.")
+        self.consumer_map[consumer_id] = consumer_shm_id
+        log.info(f"Consumer {consumer_id} registered with SHM ID: {consumer_shm_id}")
 
     def get_stats(self) -> Dict[str, Any]:
-        # Aggregated stats, more detailed via monitor
-        total_depth = sum(s.size() for s in self.shards)  # SIMULATION
-        return {
-            "type": "CppShardedSPMC",
-            "total_depth": total_depth,
-            "num_shards": self.num_shards,
-            "shm_usage_gb": self.memory_manager._next_offset / 1e9,
-            "registered_consumers": list(self.consumer_map.keys()),
-        }
+        return {"type": "CppShardedSPMCBus", "shm_name": self.tensor_shm_name, "mq_name": self.mq_name}
 
     def shutdown(self) -> None:
+        if not self._is_ready: return
         super().shutdown()
-        # Signal C++ queues to shut down if necessary
-        self.shards.clear()
-        self.memory_manager.close()  # Close and unlink SHM
+        if hasattr(self, '_tensor_data_shm_obj'): self._tensor_data_shm_obj.close()
+        if hasattr(self, 'cpp_manager'): del self.cpp_manager
         log.info("CppShardedSPMCBus resources released.")
+
+    def __getstate__(self):
+        return {
+            'master_config_dict': self.master_config.model_dump(),
+            'monitor': self.monitor,
+            'tensor_shm_name': self.tensor_shm_name,
+            'mq_name': self.mq_name,
+        }
+
+    def __setstate__(self, state):
+        self.master_config = MasterConfig.model_validate(state['master_config_dict'])
+        self.config = self.master_config.data_bus
+        self.monitor = state['monitor']
+        self.tensor_shm_name = state['tensor_shm_name']
+        self.mq_name = state['mq_name']
+
+        try:
+            self.cpp_manager = c_ext_wrapper.ShmManager(
+                self.tensor_shm_name, self.mq_name, 0, 0, create=False
+            )
+            if not self.cpp_manager.is_valid():
+                raise RuntimeError("Worker failed to re-initialize C++ ShmManager.")
+
+            self._tensor_data_shm_obj_worker = multiprocessing.shared_memory.SharedMemory(name=self.tensor_shm_name, create=False)
+            self._tensor_data_shm_view_for_pull = self._tensor_data_shm_obj_worker.buf
+        except Exception as e:
+            log.critical(f"Worker ({os.getpid()}) failed during CppShardedSPMCBus unpickling: {e}", exc_info=True)
+            self._is_ready = False
+            raise
+
+        self.consumer_map = {}
+        self._is_ready = True
+        log.info(f"CppShardedSPMCBus re-initialized in worker process ({os.getpid()}).")

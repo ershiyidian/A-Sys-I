@@ -104,3 +104,9 @@ src/asys_i/hpc/cpp_ringbuffer/build/
 
 # OSX
 .DS_Store
+
+#AI相关
+extract_code.py
+merge.py
+1.md
+output_merged_files.txt

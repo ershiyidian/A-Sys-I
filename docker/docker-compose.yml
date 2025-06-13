@@ -1,118 +1,50 @@
-# docker-compose.yml: Orchestrate App + Monitoring (HPC)
-# (FINAL VERSION)
 version: '3.8'
 
-networks:
-  asys_i_net:
-    driver: bridge
-
-volumes:
-   prometheus_data: {}
-   grafana_data: {}
-   outputs_data: {} # Docker managed volume for outputs
-   logs_data: {}     # Docker managed volume for logs
-   configs_data: {}  # Docker managed volume for configs
-
 services:
-
-  app:
+  asys-i-hpc:
     build:
       context: ..
-      dockerfile: docker/Dockerfile
-      args:
-         profile: HPC # Always use HPC with compose stack
-    image: asys-i:hpc-latest
-    container_name: asys-i-app
-    # Command to run the experiment with the HPC config
-    command: ["asys-i-run", "--config", "/app/configs/profile_hpc.yaml"] 
-    restart: on-failure
+      dockerfile: docker/Dockerfile.hpc
+    # The container needs access to the host's IPC namespace to share
+    # memory and message queues with the target application running on the host.
+    ipc: host
+    # It also needs extended privileges for some system-level operations.
+    privileged: true
+    # Mount the project directory into the container.
+    volumes:
+      - ../:/app
+      # Example of mounting a separate, fast storage for outputs.
+      # - /path/to/fast_storage:/fast_storage
+    
+    # Environment variables can be used to pass configuration.
     environment:
-       - NVIDIA_VISIBLE_DEVICES=all # Expose all GPUs to the container
-       - PYTHONUNBUFFERED=1         # Ensure Python output is not buffered
-    # GPU access configuration (requires nvidia-container-toolkit)
+      # Example: Pointing to a configuration file inside the container.
+      - ASYS_I_CONFIG_PATH=/app/configs/profile_hpc.yaml
+      # Example: Overriding the output directory from the config file.
+      # This allows output data to be written to a mounted volume easily.
+      # - ASYS_I_OUTPUT_DIR=/fast_storage/outputs/my_run_1
+    
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all # Use all available GPUs
-              capabilities: [gpu, utility, compute]
-    volumes:
-      # Map host directories to container directories. Adjust host paths as needed.
-      - ./configs:/app/configs:ro  # Mount config files read-only
-      - ../outputs:/app/outputs    # Mount output directory (persist outputs)
-      - ../logs:/app/logs          # Mount logs directory (persist logs)
-      - ../checkpoints:/app/checkpoints # Mount checkpoints directory
-      - /dev/shm:/dev/shm          # Required for multiprocessing.shared_memory (HPC DataBus)
-    ports:
-       - "8001:8001" # Prometheus metrics endpoint from app
-       - "6006:6006" # Tensorboard (if enabled in monitor config)
-    networks:
-      - asys_i_net
-    depends_on:
-       - prometheus # Ensure Prometheus is up before the app tries to expose metrics
-    shm_size: '16G' # Increase shared memory for DataBus HPC (ensure host has enough)
+              count: 1
+              capabilities: [gpu]
 
-  prometheus:
-    image: prom/prometheus:v2.47.0 # Updated to a recent stable version
-    container_name: asys-i-prometheus
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro # Prometheus config
-      - prometheus_data:/prometheus                       # Persistent storage for Prometheus data
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
-    ports:
-      - "9090:9090" # Prometheus UI
-    networks:
-       - asys_i_net
-    restart: unless-stopped # Restart unless explicitly stopped
-
-  grafana:
-     image: grafana/grafana:10.2.2 # Updated to a recent stable version
-     container_name: asys-i-grafana
-     user: "472" # Standard Grafana user ID
-     depends_on:
-       - prometheus # Grafana needs Prometheus as data source
-     ports:
-       - "3000:3000" # Grafana UI
-     volumes:
-       - grafana_data:/var/lib/grafana # Persistent storage for Grafana data
-       # Optional: Uncomment and configure if you have Grafana dashboards/datasources to provision
-       # - ./grafana_provisioning/:/etc/grafana/provisioning/ 
-     environment:
-        - GF_SECURITY_ADMIN_USER=admin
-        - GF_SECURITY_ADMIN_PASSWORD=admin # Change this in production!
-        - GF_USERS_ALLOW_SIGN_UP=false # Disable user self-registration
-        - GF_SERVER_ROOT_URL=http://localhost:3000 # Adjust if deployed behind a proxy
-     networks:
-        - asys_i_net
-     restart: unless-stopped
-
-  # TODO: Add Loki & Promtail for comprehensive log aggregation (future enhancement)
-  # loki:
-  #   image: grafana/loki:2.9.2
-  #   container_name: asys-i-loki
-  #   volumes:
-  #     - loki_data:/loki
-  #   ports:
-  #     - "3100:3100"
-  #   command: -config.file=/etc/loki/config.yaml
-  #   networks:
-  #     - asys_i_net
-  #   restart: unless-stopped
-
-  # promtail:
-  #   image: grafana/promtail:2.9.2
-  #   container_name: asys-i-promtail
-  #   volumes:
-  #     - ../logs:/var/log/app_logs:ro # Mount application logs
-  #     - /var/lib/docker/containers:/var/lib/docker/containers:ro # For docker container logs
-  #     - ./promtail-config.yaml:/etc/promtail/config.yaml:ro
-  #   command: -config.file=/etc/promtail/config.yaml
-  #   networks:
-  #     - asys_i_net
-  #   restart: unless-stopped
-
+  # This is a placeholder for the target application that is being observed.
+  # In a real scenario, this might be a separate container or a process
+  # running directly on the host.
+  target_application:
+    image: "pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime"
+    # Also needs to share the IPC namespace.
+    ipc: host
+    shm_size: '${SHM_SIZE_G:-32}g' # Use env var SHM_SIZE_G, default to 32g
+    command: tail -f /dev/null # Keep container running
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

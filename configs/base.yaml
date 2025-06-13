@@ -1,6 +1,7 @@
-# configs/base.yaml: Common default configurations
-# (FINAL VERSION)
-# Overridden by specific profiles
+# configs/base.yaml: Common default configurations (RECONSTRUCTED)
+
+# Schema version to ensure config compatibility
+schema_version: "1.0"
 
 project:
   name: "asys-i-default"
@@ -12,43 +13,43 @@ project:
 
 hardware:
   device: "cuda:0"
-  dtype: "float32" # Default to safer float32
-  use_mixed_precision: false
-  compile_model: false
+  dtype: "bfloat16" # More robust default for modern GPUs
+  use_mixed_precision: true
+  compile_model: true
 
 ppo:
    model_name: "gpt2"
-   max_steps: 500 # short run by default
+   max_steps: 1000
 
 sae_model:
-   d_in: "auto" # Auto-detect from host model
-   d_sae: 3072 # 4x expansion (can be configured)
-   l1_coefficient: 0.001
+   d_in: "auto" # Auto-detect from host model's hidden_size
+   d_sae: 3072 # 4x expansion for d_in=768
+   l1_coefficient: 0.004
 
 sae_trainer:
-   learning_rate: 0.0003
-   batch_size: 2048
-   num_workers: 1
-   save_interval_steps: 5000
-   
+   learning_rate: 0.0004
+   batch_size: 4096
+   num_workers: 4
+   save_interval_steps: 10000
+   normalize_weights_interval: 100 # New: Perform weight normalization periodically
+
 hook:
-   layers_to_hook: [3, 6, 9]
-   sampling_rate: 0.5 # Default moderate sampling
-   gpu_kernel_mode: "NONE"
+   # New FQN format for hooking
+   layers_to_hook:
+     "mlp_3": "transformer.h.3.mlp.c_proj"
+     "attn_6": "transformer.h.6.attn.c_proj"
+     "mlp_9": "transformer.h.9.mlp.c_proj"
+   sampling_rate: 1.0
+   gpu_kernel_mode: "NONE" # FP8, LZ4 etc. are future work
 
-# Defaults will be set by config_loader based on run_profile if not specified
-# data_bus: 
-#  buffer_size_per_shard: 65536 
-#  num_shards: 1 
-
+# Defaults set by config_loader based on run_profile if not specified
+# data_bus:
 # monitor:
-#   component_timeout_sec: 120
 
 archiver:
-   enabled: false # Disable by default
-   batch_size: 4096
+   enabled: false # Disabled by default for performance
+   batch_size: 8192
 
 resource_manager:
-    apply_bindings: false # Off by default
-    allocation_strategy: "auto" # Auto-allocate if apply_bindings is true
-
+    apply_bindings: false
+    allocation_strategy: "auto"
