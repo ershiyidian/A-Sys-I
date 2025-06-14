@@ -41,6 +41,8 @@ hook:
      "mlp_9": "transformer.h.9.mlp.c_proj"
    sampling_rate: 1.0
    gpu_kernel_mode: "NONE" # FP8, LZ4 etc. are future work
+   pinned_memory_size_bytes: 0 # If 0 or not set, an estimated size will be used (e.g., 64MB or based on max_elements_estimate).
+                               # Example: pinned_memory_size_bytes: 67108864 # 64MB
 
 # Defaults set by config_loader based on run_profile if not specified
 # data_bus:

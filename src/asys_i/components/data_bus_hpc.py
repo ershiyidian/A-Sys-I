@@ -48,7 +48,10 @@ class CppShardedSPMCBus(BaseDataBus):
         if not self._is_ready or not isinstance(packet.data, torch.Tensor): return False
 
         tensor = packet.data
-        tensor_cpu_numpy = tensor.contiguous().cpu().numpy()
+        # ActivationHooker is responsible for moving data to CPU (preferably pinned memory)
+        # before pushing to this bus. This assertion makes the expectation explicit.
+        assert not tensor.is_cuda, "Input tensor to CppShardedSPMCBus.push() should be on CPU."
+        tensor_cpu_numpy = tensor.contiguous().cpu().numpy() # .cpu() is no-op if already on CPU. .contiguous() is safeguard.
         
         checksum = calculate_checksum(tensor_cpu_numpy.tobytes()) if self.config.use_checksum else 0
         dtype_code_val = DTYPE_TO_CODE_MAP.get(tensor.dtype)
