@@ -35,6 +35,7 @@ class CppShardedSPMCBus(BaseDataBus):
             int(self.config.shared_memory_size_gb * 1024 * 1024 * 1024),
             self.config.buffer_size_per_shard, create=True
         )
+        log.info(f"C++ ShmManager validity for {self.tensor_shm_name}: {self.cpp_manager.is_valid()}")
         if not self.cpp_manager.is_valid():
             raise RuntimeError("Failed to initialize C++ ShmManager.")
 
@@ -68,6 +69,7 @@ class CppShardedSPMCBus(BaseDataBus):
 
         tags = {"bus_type": "cpp_spmc"}
         if not success:
+            log.warning(f"Failed to push packet to CppShardedSPMCBus (layer: {packet.layer_idx_numeric}, step: {packet.global_step}). SHM: {self.tensor_shm_name}. Potential C++ buffer full or internal error.")
             self.monitor.log_metric("data_bus_drop_count", 1, {**tags, "reason": "cpp_push_fail"})
             return False
         
@@ -117,6 +119,7 @@ class CppShardedSPMCBus(BaseDataBus):
         return {"type": "CppShardedSPMCBus", "shm_name": self.tensor_shm_name, "mq_name": self.mq_name}
 
     def shutdown(self) -> None:
+        log.info(f"Shutting down CppShardedSPMCBus: SHM Name: {self.tensor_shm_name}, MQ Name: {self.mq_name}")
         if not self._is_ready: return
         super().shutdown()
         if hasattr(self, '_tensor_data_shm_obj'): self._tensor_data_shm_obj.close()
