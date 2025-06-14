@@ -240,18 +240,86 @@ class SAETrainerWorker:
                 grouped_tensors[packet.layer_idx_numeric].append(tensor_data)
 
         final_batches: Dict[LayerIndex, torch.Tensor] = {}
-        for numeric_idx, tensor_list in grouped_tensors.items():
-            if numeric_idx in self.models: # Ensure this worker is responsible
-                if not tensor_list: continue
+
+        # First pass: Group packets, determine total sizes, dtypes, and feature dimensions for pre-allocation
+        layer_batch_info: Dict[LayerIndex, Dict[str, Any]] = defaultdict(
+            lambda: {"packets": [], "total_activations": 0, "features_dim": -1, "dtype": None}
+        )
+
+        for packet in packets:
+            tensor_data: Optional[torch.Tensor] = None
+            if isinstance(packet.data, torch.Tensor): # Consumer mode
+                tensor_data = packet.data
+            elif isinstance(packet.data, TensorRef) and self.config.run_profile == RunProfile.HPC:
                 try:
-                    # TODO: Optimization: pre-allocate large GPU buffer and copy into slices,
-                    # instead of torch.cat which does new allocation + copies.
-                    # For now, torch.cat is simpler.
-                    batch_tensor = torch.cat(tensor_list, dim=0).to(self.device, non_blocking=True)
-                    final_batches[numeric_idx] = batch_tensor
+                    tensor_data = self._reconstruct_tensor_from_ref(packet.data)
                 except Exception as e:
-                    log.error(f"{self.worker_id}: Error stacking tensors for layer index {numeric_idx}: {e}")
-                    self.monitor.log_metric("trainer_batch_error_count", 1, {**self.tags, "layer_numeric_idx": numeric_idx})
+                    log.error(f"{self.worker_id} failed to reconstruct tensor from ref {packet.data}: {e}")
+                    self.monitor.log_metric("trainer_reconstruct_error", 1, {**self.tags, "layer_numeric_idx": packet.layer_idx_numeric})
+                    continue
+            else:
+                log.warning(f"{self.worker_id} received unexpected data type in packet: {type(packet.data)}")
+                self.monitor.log_metric("trainer_data_error_count", 1, self.tags)
+                continue
+
+            if tensor_data is not None and packet.layer_idx_numeric in self.models: # Process only if worker is responsible
+                if tensor_data.ndim < 2: # Ensure tensor has at least 2 dimensions (activations, features)
+                    log.warning(f"{self.worker_id}: Skipping tensor with ndim < 2 for layer {packet.layer_idx_numeric}, shape {tensor_data.shape}")
+                    continue
+                if tensor_data.shape[0] == 0: # Skip empty tensors
+                    continue
+
+                info = layer_batch_info[packet.layer_idx_numeric]
+                info["packets"].append(tensor_data) # Store CPU tensor
+                info["total_activations"] += tensor_data.shape[0]
+                if info["features_dim"] == -1:
+                    info["features_dim"] = tensor_data.shape[-1] # Assuming last dim is features
+                    info["dtype"] = tensor_data.dtype
+                elif info["features_dim"] != tensor_data.shape[-1]:
+                    log.error(f"{self.worker_id}: Feature dimension mismatch in batch for layer {packet.layer_idx_numeric}. Expected {info['features_dim']}, got {tensor_data.shape[-1]}. Skipping this packet.")
+                    self.monitor.log_metric("trainer_batch_error_count", 1, {**self.tags, "layer_numeric_idx": packet.layer_idx_numeric, "reason": "feature_mismatch"})
+                    info["total_activations"] -= tensor_data.shape[0] # Revert addition
+                    info["packets"].pop() # Remove problematic packet
+                    continue
+                elif info["dtype"] != tensor_data.dtype:
+                    log.error(f"{self.worker_id}: Dtype mismatch in batch for layer {packet.layer_idx_numeric}. Expected {info['dtype']}, got {tensor_data.dtype}. Skipping this packet.")
+                    self.monitor.log_metric("trainer_batch_error_count", 1, {**self.tags, "layer_numeric_idx": packet.layer_idx_numeric, "reason": "dtype_mismatch"})
+                    info["total_activations"] -= tensor_data.shape[0] # Revert addition
+                    info["packets"].pop() # Remove problematic packet
+                    continue
+
+        # Second pass: Pre-allocate on GPU and copy data
+        for numeric_idx, info in layer_batch_info.items():
+            if not info["packets"] or info["total_activations"] == 0 or info["features_dim"] == -1:
+                continue
+
+            try:
+                # Pre-allocate the entire batch tensor on the target device
+                gpu_batch_buffer = torch.empty(
+                    (info["total_activations"], info["features_dim"]),
+                    dtype=info["dtype"], # Use dtype from the first valid tensor for this layer
+                    device=self.device
+                )
+                log.debug(f"{self.worker_id}: Pre-allocated GPU buffer for layer {numeric_idx} with shape {gpu_batch_buffer.shape}, dtype {gpu_batch_buffer.dtype}.")
+
+                current_offset = 0
+                for cpu_tensor in info["packets"]:
+                    num_activations_in_packet = cpu_tensor.shape[0]
+                    destination_slice = gpu_batch_buffer[current_offset : current_offset + num_activations_in_packet]
+
+                    # Perform the copy. Using .to() is generally safe and handles non-blocking.
+                    # destination_slice.copy_(cpu_tensor, non_blocking=True) # Alternative if cpu_tensor is pinned
+                    destination_slice.data = cpu_tensor.to(self.device, non_blocking=True) # Assign data to slice
+
+                    current_offset += num_activations_in_packet
+
+                final_batches[numeric_idx] = gpu_batch_buffer
+                log.debug(f"{self.worker_id}: Successfully prepared batch for layer {numeric_idx} on device {self.device} with {info['total_activations']} activations.")
+
+            except Exception as e:
+                log.error(f"{self.worker_id}: Error preparing pre-allocated batch for layer index {numeric_idx}: {e}")
+                self.monitor.log_metric("trainer_batch_error_count", 1, {**self.tags, "layer_numeric_idx": numeric_idx, "reason": "prealloc_copy_fail"})
+
         return final_batches
 
     def _save_checkpoint(self, layer_idx_numeric: LayerIndex, step: GlobalStep):

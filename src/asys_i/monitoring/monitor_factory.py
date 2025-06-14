@@ -51,10 +51,18 @@ def create_monitor(config: MasterConfig, shared_heartbeats_dict: dict) -> BaseMo
         )
 
     elif monitor_type == MonitorType.LOGGING_ONLY:
-        # TODO: Implement a pure logging monitor if needed, or reuse CSV without CSV/TB
-        log.warning("LOGGING_ONLY monitor not fully implemented, using CSV_TENSORBOARD")
+        # For LOGGING_ONLY, use LoggingCSVTensorBoardMonitor but disable its CSV/TB features
+        logging_only_monitor_config = monitor_config.model_copy(
+            update={
+                "enable_csv_logging": False,
+                "enable_tensorboard_logging": False,
+            }
+        )
+        log.info("Configuring LoggingCSVTensorBoardMonitor for LOGGING_ONLY mode (CSV/TensorBoard disabled).")
         return LoggingCSVTensorBoardMonitor(
-            monitor_config, project_config, shared_heartbeats_dict
+            logging_only_monitor_config, # Pass the modified config
+            project_config,
+            shared_heartbeats_dict,
         )
 
     elif monitor_type == MonitorType.NONE:

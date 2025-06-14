@@ -57,21 +57,42 @@ class LoggingCSVTensorBoardMonitor(BaseMonitor):
         self._lock = threading.Lock()  # Ensure thread safety for file/writer access
 
         # CSV
-        csv_path = os.path.join(self.log_dir, "metrics.csv")
-        self._csv_file = open(csv_path, "a", newline="")
-        self._csv_writer = csv.writer(self._csv_file)
-        self._csv_header_written = os.path.getsize(csv_path) > 0
-        log.info(f"Logging metrics to CSV: {csv_path}")
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_header_written = False
+        if self.monitor_config.enable_csv_logging: # Check config
+            csv_path = os.path.join(self.log_dir, "metrics.csv")
+            try:
+                self._csv_file = open(csv_path, "a", newline="")
+                self._csv_writer = csv.writer(self._csv_file)
+                self._csv_header_written = os.path.getsize(csv_path) > 0
+                log.info(f"Logging metrics to CSV: {csv_path}")
+            except Exception as e:
+                log.error(f"Failed to initialize CSV logging at {csv_path}: {e}")
+                if self._csv_file: # Ensure file is closed if open failed partially
+                    self._csv_file.close()
+                self._csv_file = None # Ensure it's None on failure
+                self._csv_writer = None
+        else:
+            log.info("CSV logging is disabled by configuration.")
 
         # TensorBoard
         self._writer: Optional[SummaryWriter] = None
-        if TENSORBOARD_AVAILABLE:
+        if self.monitor_config.enable_tensorboard_logging and TENSORBOARD_AVAILABLE: # Check config
             tb_log_dir = os.path.join(self.log_dir, "tensorboard")
             os.makedirs(tb_log_dir, exist_ok=True)
-            self._writer = SummaryWriter(log_dir=tb_log_dir)
-            log.info(f"Logging metrics to TensorBoard: {tb_log_dir}")
-        else:
-            log.warning("TensorBoard writer is not available.")
+            try:
+                self._writer = SummaryWriter(log_dir=tb_log_dir)
+                log.info(f"Logging metrics to TensorBoard: {tb_log_dir}")
+            except Exception as e:
+                log.error(f"Failed to initialize TensorBoard writer at {tb_log_dir}: {e}")
+                self._writer = None # Ensure it's None on failure
+        elif not self.monitor_config.enable_tensorboard_logging:
+            log.info("TensorBoard logging is disabled by configuration.")
+        elif not TENSORBOARD_AVAILABLE: # This condition is implicitly covered by the first if, but explicit log is fine
+            log.warning("TensorBoard logging disabled because TensorBoard/TensorBoardX not found (already logged at import).")
+            # Ensure writer is None if TENSORBOARD_AVAILABLE is False, even if enable_tensorboard_logging was True
+            self._writer = None
 
         self._last_flush = time.time()
 
@@ -84,14 +105,8 @@ class LoggingCSVTensorBoardMonitor(BaseMonitor):
         if "_writer" in state:  # Tensorboard writer
             del state["_writer"]
         # Store paths and other config needed to re-initialize
-        state["_csv_path_for_pickle"] = (
-            self._csv_file.name
-            if hasattr(self, "_csv_file") and self._csv_file
-            else None
-        )
-        state["_tb_log_dir_for_pickle"] = (
-            self._writer.log_dir if hasattr(self, "_writer") and self._writer else None
-        )
+        state["_csv_path_for_pickle"] = self._csv_file.name if hasattr(self, "_csv_file") and self._csv_file else None
+        state["_tb_log_dir_for_pickle"] = self._writer.log_dir if hasattr(self, "_writer") and self._writer else None
         return state
 
     def __setstate__(self, state):
@@ -138,20 +153,29 @@ class LoggingCSVTensorBoardMonitor(BaseMonitor):
         step: Optional[int],
         tags: Optional[Dict[str, Any]],
     ):
+        if not self._csv_writer: return # Guard for disabled CSV
         row = [timestamp, name, value, step, str(tags)]
         header = ["timestamp", "metric_name", "value", "step", "tags"]
-        with self._lock:
+        with self._lock: # Lock remains important for multi-threaded access if any, and for file operations
+            if not self._csv_writer: return # Double check inside lock, though primarily for atomicity of write+flush
+
             if not self._csv_header_written:
                 self._csv_writer.writerow(header)
                 self._csv_header_written = True
             self._csv_writer.writerow(row)
+
             # Auto-flush check
             if (
                 time.time() - self._last_flush
                 > self.monitor_config.metrics_flush_interval_sec
             ):
-                self._csv_file.flush()
-                os.fsync(self._csv_file.fileno())
+                if self._csv_file and not self._csv_file.closed: # Check if csv_file is valid
+                    self._csv_file.flush()
+                    try: # os.fsync can fail on some file systems or non-files
+                        os.fsync(self._csv_file.fileno())
+                    except OSError as e:
+                        log.debug(f"CSV os.fsync failed: {e}") # Debug as this might be expected in some envs
+
                 if self._writer:
                     self._writer.flush()
                 self._last_flush = time.time()
@@ -239,12 +263,22 @@ class LoggingCSVTensorBoardMonitor(BaseMonitor):
     def shutdown(self) -> None:
         super().shutdown()
         with self._lock:
-            if self._csv_file and not self._csv_file.closed:
-                self._csv_file.flush()
-                os.fsync(self._csv_file.fileno())
-                self._csv_file.close()
-                log.info("CSV file closed.")
-            if self._writer:
-                self._writer.flush()
-                self._writer.close()
-                log.info("TensorBoard writer closed.")
+            if hasattr(self, '_csv_file') and self._csv_file and not self._csv_file.closed:
+                try:
+                    self._csv_file.flush()
+                    os.fsync(self._csv_file.fileno())
+                    self._csv_file.close()
+                    log.info("CSV file closed.")
+                except Exception as e:
+                    log.error(f"Error during CSV file shutdown: {e}")
+            self._csv_file = None # Ensure attributes are cleared
+            self._csv_writer = None
+
+            if hasattr(self, '_writer') and self._writer:
+                try:
+                    self._writer.flush()
+                    self._writer.close()
+                    log.info("TensorBoard writer closed.")
+                except Exception as e:
+                    log.error(f"Error during TensorBoard writer shutdown: {e}")
+            self._writer = None # Ensure attribute is cleared

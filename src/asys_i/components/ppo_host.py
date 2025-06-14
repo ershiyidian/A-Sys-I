@@ -13,16 +13,19 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
+import random # Added for dummy rewards
+import torch # Added for full import list, though already partially used via F
+
 # Conditional import for TRL
 try:
     from datasets import Dataset
     from transformers import AutoModelForCausalLMWithValueHead, AutoTokenizer
-    from trl import PPOConfig, PPOTrainer
+    from trl import PPOConfig as TRLPPOConfig, PPOTrainer # Aliased PPOConfig
 
     TRL_AVAILABLE = True
 except ImportError:
     TRL_AVAILABLE = False
-    AutoModelForCausalLMWithValueHead, AutoTokenizer, PPOTrainer, PPOConfig, Dataset = (None,) * 5  # type: ignore
+    AutoModelForCausalLMWithValueHead, AutoTokenizer, PPOTrainer, TRLPPOConfig, Dataset = (None,) * 5  # type: ignore # Adjusted for alias
     logging.warning(
         "TRL or Transformers/Datasets not installed. PPOHostProcess will be unavailable."
     )
@@ -38,39 +41,7 @@ from asys_i.orchestration.config_loader import MasterConfig
 log = logging.getLogger(__name__)
 
 
-# ---- MOCK classes for simulation if TRL not available or for testing ----
-class MockModel(nn.Module):
-    def __init__(self, d_model=768, n_layers=12):
-        super().__init__()
-        self.layers = nn.ModuleList(
-            [nn.Linear(d_model, d_model) for _ in range(n_layers)]
-        )
-        self.head = nn.Linear(d_model, 1000)  # dummy vocab
-
-    def forward(self, x):
-        hidden_states = []
-        for layer in self.layers:
-            x = F.relu(layer(x))
-            hidden_states.append(x)  # Simulate activation points
-        return self.head(x), hidden_states
-
-    def generate(self, *args, **kwargs):
-        return torch.randint(0, 100, (4, 10))  # Mock generation
-
-
-class MockPPOTrainer:
-    def __init__(self, *args, **kwargs):
-        log.warning("MockPPOTrainer initialized")
-
-    def step(self, *args, **kwargs):
-        time.sleep(0.05)  # Simulate work
-        return {"ppo/loss": torch.rand(1).item(), "ppo/reward": torch.rand(1).item()}
-
-    @property
-    def model(self):
-        return MockModel()
-
-
+# MockModel and MockPPOTrainer removed
 # -----------------------------------------------------------------------
 
 
@@ -99,39 +70,75 @@ class PPOHostProcess:
 
         self.monitor.register_component(self.component_id)
 
-        log.info(f"Loading host model: {self.ppo_config.model_name}")
-        # TODO: Load model, tokenizer, reward model, setup dataset
-        # self.model = AutoModelForCausalLMWithValueHead.from_pretrained(self.ppo_config.model_name)
-        # self.tokenizer = AutoTokenizer.from_pretrained(...)
-        # self.ppo_trainer_config = PPOConfig(...)
-        # self.ppo_trainer = PPOTrainer(self.ppo_trainer_config, self.model,...)
-
-        # --- MOCK ---
-        d_model_val = config.sae_model.d_in
-        if not isinstance(d_model_val, int):
-            log.warning(
-                f"SAE d_in is '{d_model_val}', PPOHost's MockModel will use default d_model=768."
+        if not TRL_AVAILABLE:
+            log.critical(
+                "TRL components are not available. PPOHostProcess cannot function in real mode."
             )
-            d_model_val = 768  # Default for GPT2 if "auto" or other non-int
+            # According to problem, assume TRL_AVAILABLE is True for modifications.
+            # If it were False, an error should ideally be raised or handled gracefully.
+            # For now, proceeding with the assumption it's available.
+            # raise RuntimeError("TRL components unavailable, cannot initialize PPOHostProcess for real training.")
 
-        self.model: nn.Module = MockModel(
-            d_model=d_model_val,
-            n_layers=(
-                max(config.hook.layers_to_hook) + 1 if config.hook.layers_to_hook else 1
-            ),
-        )
+        log.info(f"Loading host model: {self.ppo_config.model_name}")
+
+        self.model = AutoModelForCausalLMWithValueHead.from_pretrained(self.ppo_config.model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.ppo_config.model_name)
+
+        # Add special tokens if they don't exist
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            log.info(f"Set tokenizer.pad_token to tokenizer.eos_token: {self.tokenizer.eos_token}")
+
         try:
             self.model.to(config.hardware.device)
-            log.info(f"MockModel moved to {config.hardware.device}")
+            log.info(f"HuggingFace model moved to {config.hardware.device}")
         except RuntimeError as e:
             log.warning(
-                f"Failed to move MockModel to {config.hardware.device} ({e}). Using CPU instead."
+                f"Failed to move HuggingFace model to {config.hardware.device} ({e}). Using CPU instead."
             )
             self.config.hardware.device = "cpu"  # Fallback to CPU
             self.model.to("cpu")
-        self.ppo_trainer = MockPPOTrainer()
-        log.warning("PPOHostProcess is RUNNING IN MOCK MODE!")
-        # ------------
+
+        # Initialize PPOConfig from trl (using the aliased TRLPPOConfig)
+        ppo_trl_config_args = {
+            "model_name": self.ppo_config.model_name,
+            "learning_rate": self.ppo_config.learning_rate,
+            "batch_size": self.ppo_config.batch_size,
+            "mini_batch_size": self.ppo_config.batch_size, # Simplification for now
+            "log_with": None, # Disable wandb/tensorboard logging from PPO trainer itself
+            "ppo_epochs": 1, # Simplification
+            "steps": self.ppo_config.max_steps,
+            # Add other necessary PPOConfig fields if they become relevant
+        }
+        ppo_trl_config_obj = TRLPPOConfig(**ppo_trl_config_args)
+
+        # Dummy dataset for initialization
+        # Ensure that the tokenizer has a pad_token set.
+        # It's crucial for PPO trainer that input_ids and attention_mask are present.
+        if self.tokenizer.pad_token_id is None: # Double check specifically for pad_token_id for tokenizer calls
+             self.tokenizer.pad_token = self.tokenizer.eos_token
+             log.info(f"Re-checked and set tokenizer.pad_token_id via eos_token for dummy dataset tokenization.")
+
+
+        dummy_texts = ["hello world", "this is a test"]
+        # Tokenize texts and create a dataset
+        tokenized_texts = self.tokenizer(dummy_texts, padding=True, truncation=True, return_tensors="pt")
+        dummy_dataset_dict = {
+            "input_ids": [t for t in tokenized_texts.input_ids],
+            "attention_mask": [m for m in tokenized_texts.attention_mask],
+            "query": [self.tokenizer.decode(t) for t in tokenized_texts.input_ids],
+        }
+        dummy_dataset = Dataset.from_dict(dummy_dataset_dict)
+
+        # Initialize PPOTrainer
+        self.ppo_trainer = PPOTrainer(
+            config=ppo_trl_config_obj,
+            model=self.model,
+            ref_model=None, # No separate reference model for simplicity
+            tokenizer=self.tokenizer,
+            dataset=dummy_dataset, # Provide the dummy dataset
+        )
+        # log.warning("PPOHostProcess is RUNNING IN MOCK MODE!") # This line is removed.
 
         if config.hardware.compile_model and hasattr(torch, "compile"):
             log.info("Compiling host model with torch.compile...")
@@ -141,8 +148,17 @@ class PPOHostProcess:
 
     def get_model(self) -> nn.Module:
         """Provides the model instance for ActivationHooker to attach to."""
-        # handle compiled model wrapper
-        return getattr(self.model, "_orig_mod", self.model)
+        # PPOTrainer uses an Accelerator which might wrap the model.
+        # We need the underlying nn.Module for hooks.
+        # First, unwrap the model from the accelerator.
+        if hasattr(self.ppo_trainer, 'accelerator'):
+            unwrapped_model = self.ppo_trainer.accelerator.unwrap_model(self.ppo_trainer.model)
+        else:
+            # Fallback if somehow accelerator is not present (e.g. custom PPOTrainer version)
+            unwrapped_model = self.ppo_trainer.model
+
+        # Then, handle the torch.compile wrapper if it was applied.
+        return getattr(unwrapped_model, "_orig_mod", unwrapped_model)
 
     def get_global_step(self) -> GlobalStep:
         """Provides the current training step count, for ActivationPacket timestamping."""
@@ -180,23 +196,44 @@ class PPOHostProcess:
             #    stats = self.ppo_trainer.step(queries, responses, rewards)
             # ---------------------------
 
-            # --- MOCK Loop ---
-            for step in range(self.ppo_config.max_steps):
+            # --- Real Loop Structure (Simplified) ---
+            for step in range(self.ppo_config.max_steps): # Keep existing loop structure
                 if self._stop_event.is_set():
                     log.info("Stop event detected. Exiting training loop.")
                     break
 
-                # --- Simulate Forward Pass to Trigger Hooks ---
-                dummy_input = torch.randn(
-                    self.ppo_config.batch_size,
-                    self.config.sae_model.d_in,
-                    device=self.config.hardware.device,
-                )
-                with torch.no_grad():  # Hooks still trigger
-                    _ = self.model(dummy_input)
-                # -----------------------------------------------
+                # Generate dummy query tensors (batch of tokenized text)
+                dummy_queries_str = ["simulate query 1"] * self.ppo_config.batch_size
+                query_tokens = self.tokenizer(
+                    dummy_queries_str, padding=True, truncation=True, return_tensors="pt"
+                ).to(self.config.hardware.device)
 
-                stats = self.ppo_trainer.step()  # Simulate PPO step
+                # query_tensors_list is a list of 1D tensors [batch_size, query_length]
+                query_tensors_list = [q_ids for q_ids in query_tokens["input_ids"]]
+
+                # Generate responses using ppo_trainer.generate
+                # Hooks will trigger inside model.forward() called by generate() and step()
+                generation_kwargs = {
+                    "min_length": -1, # avoid warning if pad_token_id is eos_token_id
+                    "top_k": 0.0,
+                    "top_p": 1.0,
+                    "do_sample": True,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "max_new_tokens": 10, # Keep responses short for dummy data
+                    # "output_scores": True, # Not needed for step, but useful for debugging generation
+                }
+                # PPOTrainer.generate expects List[torch.Tensor] (queries)
+                # It returns List[torch.Tensor] (responses)
+                response_tensors_list = self.ppo_trainer.generate(query_tensors_list, **generation_kwargs)
+                # response_tensors_list are on the correct device as per PPOTrainer's internal handling.
+
+                # Dummy rewards (batch_size list of scalars)
+                dummy_rewards = [torch.tensor(random.random(), device=self.config.hardware.device) for _ in range(self.ppo_config.batch_size)]
+
+                # The PPO step. Model's forward pass (and thus hooks) will be triggered internally by TRL.
+                # PPOTrainer.step expects: List[torch.Tensor] queries, List[torch.Tensor] responses, List[torch.Tensor] scores
+                stats = self.ppo_trainer.step(query_tensors_list, response_tensors_list, dummy_rewards)
+
                 self._global_step = step + 1
 
                 self.monitor.log_metrics(
@@ -209,10 +246,13 @@ class PPOHostProcess:
                     last_heartbeat = time.time()
 
                 if (step + 1) % 100 == 0:
+                    # TRL PPOTrainer stats often include 'ppo/mean_scores' or 'ppo/rewards/mean' etc.
+                    # Using a general name that might be present, with a fallback.
+                    reward_metric = stats.get('ppo/mean_scores', stats.get('ppo/mean_reward', stats.get('ppo/rewards/mean', -1)))
                     log.info(
-                        f"PPO Step {self._global_step}/{self.ppo_config.max_steps} - Loss: {stats.get('ppo/loss',-1):.4f}"
+                        f"PPO Step {self._global_step}/{self.ppo_config.max_steps} - Mean PPO Reward: {reward_metric:.4f}"
                     )
-            # -----------------
+            # --- End of Real Loop Structure (Simplified) ---
             log.info("PPO training loop finished.")
 
         except KeyboardInterrupt:

@@ -127,6 +127,8 @@ class MonitorConfig(BaseModel):
     metrics_flush_interval_sec: float = Field(10.0, gt=0)
     heartbeat_check_interval_sec: float = Field(15.0, gt=0) # Reduced for faster detection
     component_timeout_sec: int = Field(60, gt=0) # Stricter default timeout
+    enable_csv_logging: bool = True # New field
+    enable_tensorboard_logging: bool = True # New field
 
     @validator('component_timeout_sec')
     def timeout_gt_check_interval(cls, v, values):

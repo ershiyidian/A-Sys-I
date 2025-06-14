@@ -91,23 +91,70 @@ class ActivationHooker:
 
                         if user_pinned_buffer_size_bytes > 0:
                             pinned_buffer_size_bytes = user_pinned_buffer_size_bytes
-                            log.info(f"Using user-defined pinned memory buffer size: {pinned_buffer_size_bytes / 1e6:.2f}MB.")
+                            log.info(f"HPC mode: Using user-defined pinned memory buffer size: {pinned_buffer_size_bytes / 1e6:.2f}MB.")
                         else:
-                            # Fallback to existing logic: hardcoded 64MB or estimate
-                            # For now, let's keep the 64MB default if not using more sophisticated estimation.
-                            # TODO: Implement more dynamic estimation if user_pinned_buffer_size_bytes is 0.
-                            pinned_buffer_size_bytes = 64 * 1024 * 1024 # Default 64MB
-                            # Alternative: Use max_elements_estimate if it was more robustly calculated
-                            # elements_for_pinned_buffer_est = max_elements_estimate # if max_elements_estimate > 0 else (fallback_elements)
-                            # pinned_buffer_size_bytes = elements_for_pinned_buffer_est * buffer_dtype.itemsize
+                            log.info("HPC mode: `hook.pinned_memory_size_bytes` not set by user. Attempting to estimate optimal size.")
+                            max_estimated_layer_bytes = 0
+                            assumed_max_seq_len = 1024 # Hardcoded as per subtask, could be HookConfig item
+                            batch_size = config.ppo.batch_size # Main config has ppo settings
 
-                            log.info(
-                                f"Using estimated/default pinned memory buffer size: {pinned_buffer_size_bytes / 1e6:.2f}MB. "
-                                f"This can be explicitly set via 'hook.pinned_memory_size_bytes' in the config for better control."
-                            )
+                            # buffer_dtype already derived earlier
+                            # buffer_dtype_str = config.hardware.dtype
+                            # from asys_i.common.types import get_torch_dtype_from_str as common_get_dtype
+                            # buffer_dtype = common_get_dtype(buffer_dtype_str)
+                            dtype_itemsize = buffer_dtype.itemsize
+
+                            if not self.hook_config.layers_to_hook:
+                                log.warning("HPC mode: No layers configured in `hook.layers_to_hook`. Cannot estimate pinned memory size based on layers.")
+                            else:
+                                for friendly_name, fqn_path in self.hook_config.layers_to_hook.items():
+                                    module = self._get_module_by_fqn(fqn_path) # Uses self.model internally
+                                    if module:
+                                        features_dim = -1
+                                        if isinstance(module, nn.Linear):
+                                            features_dim = module.out_features
+                                        elif hasattr(module, 'config'):
+                                            if hasattr(module.config, 'hidden_size'):
+                                                features_dim = module.config.hidden_size
+                                            elif hasattr(module.config, 'd_model'):
+                                                features_dim = module.config.d_model
+
+                                        if features_dim == -1 and isinstance(config.sae_model.d_in, int) and config.sae_model.d_in > 0:
+                                            log.warning(
+                                                f"HPC mode: Could not determine features_dim for layer '{friendly_name}' ({fqn_path}, type: {type(module).__name__}). "
+                                                f"Falling back to sae_model.d_in ({config.sae_model.d_in}) for estimation for this layer."
+                                            )
+                                            features_dim = config.sae_model.d_in
+                                        elif features_dim == -1:
+                                            log.warning(
+                                                f"HPC mode: Could not determine features_dim for layer '{friendly_name}' ({fqn_path}, type: {type(module).__name__}) and sae_model.d_in is not a valid fallback. "
+                                                f"This layer won't be accurately included in pinned memory estimation."
+                                            )
+
+                                        if features_dim > 0:
+                                            # Assuming 3D activations: (batch, seq, features)
+                                            current_layer_elements = batch_size * assumed_max_seq_len * features_dim
+                                            current_layer_bytes = current_layer_elements * dtype_itemsize
+                                            if current_layer_bytes > max_estimated_layer_bytes:
+                                                log.debug(f"HPC mode: Est. layer '{friendly_name}' ({fqn_path}) size: {current_layer_bytes / 1e6:.2f}MB (b={batch_size},s={assumed_max_seq_len},f={features_dim})")
+                                                max_estimated_layer_bytes = current_layer_bytes
+                                    else:
+                                        log.warning(f"HPC mode: Module for FQN path '{fqn_path}' (Friendly name: '{friendly_name}') not found during pinned memory estimation.")
+
+                            if max_estimated_layer_bytes > 0:
+                                pinned_buffer_size_bytes = int(max_estimated_layer_bytes * 1.1) # 10% safety buffer
+                                log.info(f"HPC mode: Using estimated pinned memory buffer size: {pinned_buffer_size_bytes / 1e6:.2f}MB (based on max layer size {max_estimated_layer_bytes / 1e6:.2f}MB).")
+                            else:
+                                # Fallback to a default size if no layers estimated or layers_to_hook is empty
+                                pinned_buffer_size_bytes = getattr(self.hook_config, 'default_pinned_memory_size_bytes', 64 * 1024 * 1024) # Default 64MB
+                                log.warning(
+                                    f"HPC mode: Could not estimate pinned memory size based on layers (max_estimated_layer_bytes={max_estimated_layer_bytes}). "
+                                    f"Falling back to default size: {pinned_buffer_size_bytes / 1e6:.2f}MB. "
+                                    f"This can be explicitly set via 'hook.pinned_memory_size_bytes' or implicitly via 'hook.default_pinned_memory_size_bytes'."
+                                )
 
                         if pinned_buffer_size_bytes > 0:
-                            elements_for_pinned_buffer = pinned_buffer_size_bytes // buffer_dtype.itemsize
+                            elements_for_pinned_buffer = pinned_buffer_size_bytes // dtype_itemsize # Use already known dtype_itemsize
                             if elements_for_pinned_buffer > 0:
                                 self.pinned_memory_buffer = torch.empty(elements_for_pinned_buffer, dtype=buffer_dtype, pin_memory=True)
                                 log.info(f"HPC mode: Pre-allocated pinned memory buffer of {pinned_buffer_size_bytes / 1e6:.2f}MB for async GPU->CPU copy.")
