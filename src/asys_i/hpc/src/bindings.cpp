@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include "cpp_ringbuffer/shm_manager.h"
+#include "torch_dtype_pybind_bindings.inc" // Generated enum bindings
 
 namespace py = pybind11;
 
@@ -75,17 +76,8 @@ private:
 PYBIND11_MODULE(c_ext_wrapper, m) {
     m.doc() = "C++ extension for A-Sys-I High-Performance Data Bus (v0.3.0)";
 
-    py::enum_<asys_i_hpc::TorchDtypeCode>(m, "TorchDtypeCode")
-        .value("UNKNOWN", asys_i_hpc::TorchDtypeCode::UNKNOWN)
-        .value("FLOAT32", asys_i_hpc::TorchDtypeCode::FLOAT32)
-        .value("FLOAT16", asys_i_hpc::TorchDtypeCode::FLOAT16)
-        .value("BFLOAT16", asys_i_hpc::TorchDtypeCode::BFLOAT16)
-        .value("INT64", asys_i_hpc::TorchDtypeCode::INT64)
-        .value("INT32", asys_i_hpc::TorchDtypeCode::INT32)
-        .value("INT16", asys_i_hpc::TorchDtypeCode::INT16)
-        .value("INT8", asys_i_hpc::TorchDtypeCode::INT8)
-        .value("UINT8", asys_i_hpc::TorchDtypeCode::UINT8)
-        .export_values();
+    // Register the TorchDtypeCode enum using the generated function
+    asys_i::hpc::register_torch_dtype_enum(m);
 
     py::class_<PacketMetadata>(m, "PacketMetadata")
         .def_readonly("shm_data_offset", &PacketMetadata::shm_data_offset)

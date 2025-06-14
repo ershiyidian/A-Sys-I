@@ -82,6 +82,53 @@ inline std::string to_string(TorchDtypeCode code) {
     }
 }
 
+// Helper function to get the size in bytes for a TorchDtypeCode
+inline size_t get_dtype_size_bytes(TorchDtypeCode code) {
+    switch (code) {
+"""
+    # Mapping from Python dtype string (short form like 'float32') to C++ size expression
+    # This map should cover all dtypes present in DTYPE_TO_CODE_MAP
+    dtype_shortname_to_size_expr = {
+        "float32": "sizeof(float)",
+        "float64": "sizeof(double)",  # torch.double
+        "double": "sizeof(double)",   # Alias for float64
+        "complex64": "sizeof(float) * 2",
+        "complex128": "sizeof(double) * 2", # torch.cdouble
+        "cdouble": "sizeof(double) * 2",  # Alias for complex128
+        "float16": "2",  # sizeof(uint16_t) effectively, but hardcoded for simplicity as no std::float16_t yet
+        "half": "2",     # Alias for float16
+        "bfloat16": "2", # sizeof(uint16_t) effectively
+        "uint8": "sizeof(uint8_t)",
+        "int8": "sizeof(int8_t)",
+        "int16": "sizeof(int16_t)",   # torch.short
+        "short": "sizeof(int16_t)",   # Alias for int16
+        "int32": "sizeof(int32_t)",   # torch.int
+        "int": "sizeof(int32_t)",     # Alias for int32
+        "int64": "sizeof(int64_t)",   # torch.long
+        "long": "sizeof(int64_t)",    # Alias for int64
+        "bool": "sizeof(bool)"        # Or sizeof(uint8_t) if specific packing is needed
+    }
+
+    for (dtype_str, _) in sorted_dtypes:
+        enum_name = dtype_str.split('.')[-1] # e.g. "float32" from "torch.float32"
+        size_expr = dtype_shortname_to_size_expr.get(enum_name)
+        if size_expr is None:
+            # This case should ideally not be reached if dtype_shortname_to_size_expr is comprehensive
+            # and DTYPE_TO_CODE_MAP only contains supported types.
+            # However, as a fallback, one might add an error or a default size.
+            # For now, we assume all dtypes in DTYPE_TO_CODE_MAP will be in our mapping.
+            # If a new dtype is added to Python map, it must be added here too.
+            # Consider raising an error during script execution if a mapping is missing.
+            print(f"Warning: No size mapping for dtype '{enum_name}' (from '{dtype_str}') in generate_cpp_header.py. It will lead to C++ compilation error.", file=sys.stderr)
+            header += f'        // case TorchDtypeCode::{enum_name}: /* ERROR: No size mapping in script */ break;\n'
+        else:
+            header += f"        case TorchDtypeCode::{enum_name}: return {size_expr};\n"
+
+    header += """        default:
+            throw std::runtime_error("Unsupported or unknown TorchDtypeCode in get_dtype_size_bytes: " + std::to_string(static_cast<int>(code)));
+    }
+}
+
 } // namespace hpc
 } // namespace asys_i
 
@@ -89,34 +136,91 @@ inline std::string to_string(TorchDtypeCode code) {
 """
     return header
 
+def generate_pybind_enum_registration_content(dtype_map: dict) -> str:
+    """Generates the C++ pybind11 enum registration code content."""
+    content = """//
+// Created by A-Sys-I automated script. DO NOT EDIT.
+// Source: src/asys_i/common/types.py (via generate_cpp_header.py)
+//
+
+#ifndef TORCH_DTYPE_PYBIND_BINDINGS_INC
+#define TORCH_DTYPE_PYBIND_BINDINGS_INC
+
+#include <pybind11/pybind11.h>
+#include "torch_dtype_codes.h" // Generated header with TorchDtypeCode enum
+
+namespace py = pybind11;
+
+namespace asys_i {
+namespace hpc {
+
+// Static function to register the TorchDtypeCode enum with pybind11
+static void register_torch_dtype_enum(py::module_ &m) {
+    py::enum_<TorchDtypeCode>(m, "TorchDtypeCode", "Enum for Torch dtypes")
+"""
+    # Sort by code to ensure a stable, deterministic output
+    sorted_dtypes = sorted(dtype_map.items(), key=lambda item: item[1])
+    for (dtype_str, _) in sorted_dtypes:
+        # 'torch.float32' -> 'float32'
+        enum_name_cpp = dtype_str.split('.')[-1]
+        # 'float32' -> 'FLOAT32'
+        enum_name_python = enum_name_cpp.upper()
+        content += f'        .value("{enum_name_python}", TorchDtypeCode::{enum_name_cpp})\n'
+
+    content += """        .export_values();
+}
+
+} // namespace hpc
+} // namespace asys_i
+
+#endif // TORCH_DTYPE_PYBIND_BINDINGS_INC
+"""
+    return content
+
+def write_if_changed(target_path: Path, new_content: str):
+    """Writes the new_content to target_path only if it differs from existing content."""
+    os.makedirs(target_path.parent, exist_ok=True)
+    existing_content = ""
+    if target_path.exists():
+        with open(target_path, 'r', encoding='utf-8') as f:
+            existing_content = f.read()
+
+    if new_content != existing_content:
+        with open(target_path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        print(f"File '{target_path.name}' generated/updated successfully at {target_path.parent}.")
+        return True
+    else:
+        print(f"File '{target_path.name}' is already up-to-date. No changes made.")
+        return False
+
 def main():
-    """Main function to parse the Python source and generate the C++ header."""
+    """Main function to parse the Python source and generate C++ files."""
     # Assume this script is in project_root/scripts/
     project_root = Path(__file__).parent.parent
     source_py_path = project_root / 'src' / 'asys_i' / 'common' / 'types.py'
-    target_header_path = project_root / 'src' / 'asys_i' / 'hpc' / 'cpp_ringbuffer' / 'torch_dtype_codes.h'
+
     print(f"Parsing dtype map from: {source_py_path}")
     dtype_map = parse_dtype_map_from_file(source_py_path)
-    print(f"Generating C++ header file at: {target_header_path}")
-    content = generate_header_content(dtype_map)
-    os.makedirs(target_header_path.parent, exist_ok=True)
+
+    # Generate C++ header for TorchDtypeCode enum
+    target_header_path = project_root / 'src' / 'asys_i' / 'hpc' / 'cpp_ringbuffer' / 'torch_dtype_codes.h'
+    print(f"Processing C++ header file: {target_header_path.name}")
+    header_content = generate_header_content(dtype_map)
     try:
-        # Only write the file if the content has changed to avoid unnecessary
-        # recompilations of the C++ extension.
-        existing_content = ""
-        if os.path.exists(target_header_path):
-            with open(target_header_path, 'r', encoding='utf-8') as f:
-                existing_content = f.read()
-
-        if content != existing_content:
-            with open(target_header_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            print("Header file generated/updated successfully.")
-        else:
-            print("Header file is already up-to-date. No changes made.")
-
+        write_if_changed(target_header_path, header_content)
     except IOError as e:
         print(f"Error writing to file {target_header_path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Generate C++ include for pybind11 enum registration
+    target_pybind_path = project_root / 'src' / 'asys_i' / 'hpc' / 'src' / 'torch_dtype_pybind_bindings.inc'
+    print(f"Processing C++ pybind include file: {target_pybind_path.name}")
+    pybind_content = generate_pybind_enum_registration_content(dtype_map)
+    try:
+        write_if_changed(target_pybind_path, pybind_content)
+    except IOError as e:
+        print(f"Error writing to file {target_pybind_path}: {e}", file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":
