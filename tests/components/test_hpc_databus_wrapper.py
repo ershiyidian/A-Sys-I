@@ -11,6 +11,7 @@ from asys_i.hpc import CPP_EXTENSION_AVAILABLE, SHM_NAME_PREFIX
 if CPP_EXTENSION_AVAILABLE:
     from asys_i.components.data_bus_hpc import CppShardedSPMCBus
     from asys_i.common.types import ActivationPacket, RunProfile, TensorRef, get_str_from_torch_dtype, calculate_checksum
+    from asys_i.common.types import DTYPE_TO_CODE_MAP # Added for the new test
 
 from asys_i.orchestration.config_loader import MasterConfig
 
@@ -161,3 +162,60 @@ def test_hpc_bus_checksum_error(hpc_bus_instance: CppShardedSPMCBus, hpc_config:
     mock_sae_worker.monitor.log_metric.assert_any_call("trainer_checksum_error_count", 1, tags=pytest.ANY)
     shm_test_view.close()
 
+
+def test_torch_dtype_code_synchronization():
+    if not CPP_EXTENSION_AVAILABLE:
+        pytest.skip("HPC C++ extension not available, cannot test TorchDtypeCode enum.")
+
+    try:
+        # Attempt to import the C++ extension module directly or its members
+        # This path might vary based on how pybind11 names and packages the module.
+        # Given CMake module name is 'c_ext_wrapper', it might be in 'asys_i.hpc'.
+        from asys_i.hpc.c_ext_wrapper import TorchDtypeCode
+    except ImportError:
+        try:
+            # Fallback if it's not directly in asys_i.hpc (e.g. if it's a top level module)
+            # This depends on how `pip install -e .` makes it available.
+            # Let's assume the build system places it such that it can be imported.
+            # The CMakeLists.txt sets OUTPUT_NAME "c_ext_wrapper", no specific package path there.
+            # Hatchling might place it inside asys_i/hpc/.
+            # If this still fails, the test won't run, but the logic is what we want to add.
+            import c_ext_wrapper # Try direct import if it's top-level in site-packages
+            TorchDtypeCode = c_ext_wrapper.TorchDtypeCode
+        except ImportError:
+            pytest.fail("Failed to import TorchDtypeCode from C++ extension 'c_ext_wrapper'. "
+                        "Ensure it's built and importable. Module might be in asys_i.hpc.c_ext_wrapper or similar.")
+
+
+    assert len(DTYPE_TO_CODE_MAP) > 0, "DTYPE_TO_CODE_MAP is empty, cannot verify synchronization."
+
+    # Check that all items in DTYPE_TO_CODE_MAP are present in the C++ enum and match
+    for dtype_str, expected_code in DTYPE_TO_CODE_MAP.items():
+        # 'torch.float32' -> 'FLOAT32'
+        python_enum_name = dtype_str.split('.')[-1].upper()
+
+        try:
+            actual_enum_member = getattr(TorchDtypeCode, python_enum_name)
+        except AttributeError:
+            pytest.fail(f"TorchDtypeCode enum in C++ extension is missing member '{python_enum_name}' "
+                        f"corresponding to '{dtype_str}' from DTYPE_TO_CODE_MAP.")
+
+        assert int(actual_enum_member) == expected_code, \
+            f"Mismatch for {dtype_str}: Python's DTYPE_TO_CODE_MAP code is {expected_code}, " \
+            f"but C++ TorchDtypeCode.{python_enum_name} is {int(actual_enum_member)}."
+
+        # Check reverse mapping: C++ code to enum member
+        assert TorchDtypeCode(expected_code) == actual_enum_member, \
+            f"Mismatch for code {expected_code} ({dtype_str}): C++ TorchDtypeCode({expected_code}) " \
+            f"is not TorchDtypeCode.{python_enum_name}."
+
+    # Check that the C++ enum does not have extra members not in DTYPE_TO_CODE_MAP
+    # (This assumes DTYPE_TO_CODE_MAP is the single source of truth)
+    py_enum_names_from_map = {dtype_str.split('.')[-1].upper() for dtype_str in DTYPE_TO_CODE_MAP.keys()}
+
+    # getattr(TorchDtypeCode, '__members__') gives a dict like {'FLOAT32': <TorchDtypeCode.FLOAT32: 0>, ...}
+    cpp_enum_members = TorchDtypeCode.__members__
+
+    for cpp_enum_name_str, _ in cpp_enum_members.items():
+        assert cpp_enum_name_str in py_enum_names_from_map, \
+            f"C++ TorchDtypeCode has member '{cpp_enum_name_str}' which is not derived from DTYPE_TO_CODE_MAP."

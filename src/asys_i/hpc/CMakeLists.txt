@@ -102,9 +102,9 @@ find_package(pybind11 CONFIG REQUIRED)
 
 set(SOURCES
 
-    cpp_ringbuffer/ring_buffer.cpp
+    src/bindings.cpp
 
-    cpp_ringbuffer/pybind_wrapper.cpp
+    cpp_ringbuffer/shm_manager.cpp
 
 )
 
@@ -112,7 +112,7 @@ set(SOURCES
 
 pybind11_add_module(
 
-    cpp_ringbuffer
+    c_ext_wrapper
 
     ${SOURCES}
 
@@ -122,13 +122,14 @@ pybind11_add_module(
 
 # Link libraries and include directories
 
-target_include_directories(cpp_ringbuffer PRIVATE
+target_include_directories(c_ext_wrapper PRIVATE
 
-    ${pybind11_INCLUDE_DIRS}
+    ${pybind11_INCLUDE_DIRS}
 
-    ${BOOST_INCLUDE_DIRS}
+    ${BOOST_INCLUDE_DIRS}
 
-    cpp_ringbuffer # To find our generated torch_dtype_codes.h
+    cpp_ringbuffer  # For shm_manager.h and torch_dtype_codes.h
+    src             # For torch_dtype_pybind_bindings.inc
 
 )
 
@@ -140,7 +141,7 @@ target_include_directories(cpp_ringbuffer PRIVATE
 
 if (UNIX AND NOT APPLE)
 
-    target_link_libraries(cpp_ringbuffer PRIVATE rt)
+    target_link_libraries(c_ext_wrapper PRIVATE rt)
 
 endif()
 
@@ -148,10 +149,10 @@ endif()
 
 # Set properties for the output file to be a standard Python extension
 
-set_target_properties(cpp_ringbuffer PROPERTIES
+set_target_properties(c_ext_wrapper PROPERTIES
 
     PREFIX ""
 
-    OUTPUT_NAME "cpp_ringbuffer"
+    OUTPUT_NAME "c_ext_wrapper"
 
 )
