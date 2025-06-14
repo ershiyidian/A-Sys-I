@@ -83,6 +83,13 @@ class ExperimentPipeline:
                     # Fallback: inspect model layers (more fragile)
                     first_linear_layer = next((m for m in host_model_for_inspection.modules() if isinstance(m, torch.nn.Linear)), None)
                     if first_linear_layer:
+                        log.warning(
+                            "Using fallback heuristic for 'sae_model.d_in': detected from the first torch.nn.Linear layer's 'in_features'. "
+                            "This heuristic can be unreliable for complex model architectures. "
+                            "If the detected dimension (%s) is incorrect or questionable, "
+                            "please explicitly set 'sae_model.d_in' in your configuration file.",
+                            first_linear_layer.in_features
+                        )
                         detected_dim = first_linear_layer.in_features
                         log.info(f"Used heuristic: d_in={detected_dim} from first Linear layer input features.")
                     else: # No Linear layers found or other issue

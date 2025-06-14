@@ -1,4 +1,5 @@
 import torch
+import enum
 
 # This map is the single source of truth for dtype-to-code mapping.
 # The C++ enum `TorchDtypeCode` is generated from this map at build time.
@@ -20,3 +21,10 @@ DTYPE_TO_CODE_MAP = {
 
 # Reverse mapping for convenience
 CODE_TO_DTYPE_MAP = {v: getattr(torch, k.split('.')[-1]) for k, v in DTYPE_TO_CODE_MAP.items()}
+
+# Generic type for component identifiers
+ComponentID = str
+
+class DataBusType(enum.Enum):
+    CPP_SHARDED_SPMC = "cpp_sharded_spmc"
+    PYTHON_QUEUE = "python_queue"

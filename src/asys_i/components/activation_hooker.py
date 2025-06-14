@@ -81,17 +81,43 @@ class ActivationHooker:
                         # Max shape could be (ppo_batch_size * max_seq_len, d_in)
                         # A simple large pinned buffer:
                         # Example: 16 batch * 512 seq_len * 768 d_in * 2 bytes (bf16) ~ 12MB
-                        # This needs to be configurable or dynamically sized based on actual hooked tensor shapes.
-                        # For now, let's make a reasonably sized buffer:
-                        # Heuristic: assume it can hold a few batches of (PPO_BATCH_SIZE, config.sae_model.d_in)
-                        # This is still very approximate.
-                        # True max size depends on the largest activation tensor encountered.
-                        # Let's allocate a buffer of, say, 64MB.
-                        pinned_buffer_size_bytes = 64 * 1024 * 1024
-                        elements_for_pinned_buffer = pinned_buffer_size_bytes // buffer_dtype.itemsize
 
-                        self.pinned_memory_buffer = torch.empty(elements_for_pinned_buffer, dtype=buffer_dtype, pin_memory=True)
-                        log.info(f"HPC mode: Pre-allocated pinned memory buffer of {pinned_buffer_size_bytes / 1e6:.2f}MB for async GPU->CPU copy.")
+                        buffer_dtype_str = config.hardware.dtype
+                        from asys_i.common.types import get_torch_dtype_from_str as common_get_dtype
+                        buffer_dtype = common_get_dtype(buffer_dtype_str)
+
+                        # New logic for pinned_memory_size_bytes
+                        user_pinned_buffer_size_bytes = getattr(self.hook_config, 'pinned_memory_size_bytes', 0)
+
+                        if user_pinned_buffer_size_bytes > 0:
+                            pinned_buffer_size_bytes = user_pinned_buffer_size_bytes
+                            log.info(f"Using user-defined pinned memory buffer size: {pinned_buffer_size_bytes / 1e6:.2f}MB.")
+                        else:
+                            # Fallback to existing logic: hardcoded 64MB or estimate
+                            # For now, let's keep the 64MB default if not using more sophisticated estimation.
+                            # TODO: Implement more dynamic estimation if user_pinned_buffer_size_bytes is 0.
+                            pinned_buffer_size_bytes = 64 * 1024 * 1024 # Default 64MB
+                            # Alternative: Use max_elements_estimate if it was more robustly calculated
+                            # elements_for_pinned_buffer_est = max_elements_estimate # if max_elements_estimate > 0 else (fallback_elements)
+                            # pinned_buffer_size_bytes = elements_for_pinned_buffer_est * buffer_dtype.itemsize
+
+                            log.info(
+                                f"Using estimated/default pinned memory buffer size: {pinned_buffer_size_bytes / 1e6:.2f}MB. "
+                                f"This can be explicitly set via 'hook.pinned_memory_size_bytes' in the config for better control."
+                            )
+
+                        if pinned_buffer_size_bytes > 0:
+                            elements_for_pinned_buffer = pinned_buffer_size_bytes // buffer_dtype.itemsize
+                            if elements_for_pinned_buffer > 0:
+                                self.pinned_memory_buffer = torch.empty(elements_for_pinned_buffer, dtype=buffer_dtype, pin_memory=True)
+                                log.info(f"HPC mode: Pre-allocated pinned memory buffer of {pinned_buffer_size_bytes / 1e6:.2f}MB for async GPU->CPU copy.")
+                            else:
+                                log.warning(f"HPC mode: Calculated elements for pinned memory is 0 (size: {pinned_buffer_size_bytes}B, dtype: {buffer_dtype}). Buffer not allocated.")
+                                self.pinned_memory_buffer = None
+                        else:
+                            log.info("HPC mode: Pinned memory buffer size is 0. Buffer not allocated.")
+                            self.pinned_memory_buffer = None
+
                     except Exception as e:
                         log.warning(f"HPC mode: Failed to pre-allocate pinned memory buffer: {e}. Async copy might be slower.")
                         self.pinned_memory_buffer = None
@@ -213,6 +239,25 @@ class ActivationHooker:
                     # if the C++ side reads immediately without its own sync.
                     # However, CppDataBus.push(numpy_array) implies CPU data access.
                     # The copy_ non_blocking needs a stream.synchronize() before CPU can safely access data.
+
+                    # --- Synchronization Point ---
+                    # This synchronize() call ensures that the asynchronous GPU-to-CPU data transfer
+                    # (copying `processed_tensor_gpu` to `pinned_slice` in pinned CPU memory)
+                    # is complete before the Python code proceeds.
+                    #
+                    # Performance Implication:
+                    # This introduces a synchronization point directly within the model's forward pass
+                    # (as this hook is part of it). Waiting for the H2D copy to finish can become a
+                    # performance bottleneck, as the main PPO training loop (which calls forward)
+                    # will stall here.
+                    #
+                    # Future Optimization:
+                    # To mitigate this, one could remove or defer this synchronization. However, that
+                    # would require the downstream data bus (CppShardedSPMCBus and its C++ backend)
+                    # to be aware of CUDA events or manage data readiness through other asynchronous
+                    # mechanisms (e.g., the C++ layer polls a CUDA event or receives one).
+                    # This is a more complex change involving modifications to the C++ data handling layer.
+                    # For now, explicit synchronization here ensures data integrity for the CppDataBus.
                     self.cuda_stream.synchronize() # Ensure GPU-CPU copy is complete
 
                     packet = ActivationPacket( # For HPC, this packet is passed to CppBus.push
